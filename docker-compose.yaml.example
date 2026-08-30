@@ -1,0 +1,59 @@
+# Copy to docker-compose.yaml and edit. One service per model; several can
+# share a host by taking disjoint gpus.devices slices in their configs.
+services:
+  dsv4-flash:
+    image: viiwork-freetoken:latest
+    build:
+      context: .
+      args:
+        VERSION: dev
+        # Pin the toolkit the kernels are JIT-compiled against. Must be a
+        # *devel* image — see the Dockerfile.
+        CUDA_TAG: 13.3.1-devel-ubuntu24.04
+        # Pin the engine. Empty takes the latest release from PyPI, which means
+        # a rebuild can change the inference stack under you.
+        FREETOKEN_VERSION: ""
+    restart: unless-stopped
+    # Host networking keeps the mesh simple: peers dial each other by
+    # host:port, and the contended mesh port (8086) has to be the host's, not a
+    # container-private one.
+    network_mode: host
+    volumes:
+      - ./configs/viiwork-freetoken.dsv4-flash.yaml:/config/viiwork-freetoken.yaml:ro
+      # Weights. A local directory rather than the HF cache is the usual shape
+      # here: the models this engine runs are hundreds of gigabytes, and `ft
+      # checkpoint` writes its FTW fast-load form beside them.
+      - /models:/models:ro
+      # Model cache, for the HF-repo-id form of model.path.
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      # FreeToken's own cache: JIT-compiled CUDA kernels and the `ft bench bw`
+      # bandwidth profile. Without this volume every container start recompiles
+      # kernels, and the profile that makes --moe-backend auto pick `hybrid` is
+      # lost on each restart.
+      - ${HOME}/.cache/freetoken:/root/.cache/freetoken
+    environment:
+      # Only needed for gated or private models.
+      - HF_TOKEN=${HF_TOKEN:-}
+    # The engine's inter-process channels and, on an offload MoE backend, the
+    # host-memory staging for expert weights. The Docker default of 64 MB is
+    # far too small and shows up as a hang at load time.
+    shm_size: "16gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # The node's /health reports 503 until a backend is actually serving —
+      # not merely listening — which is what makes this meaningful during
+      # FreeToken's multi-minute startup.
+      test: ["CMD", "curl", "-fsS", "http://localhost:9801/health"]
+      interval: 30s
+      timeout: 5s
+      # Generous: weights, cache pools, CUDA graphs and then filling a GPU
+      # expert cache from host memory. Keep this at or above
+      # freetoken.startup_timeout in the config.
+      start_period: 20m
+      retries: 3

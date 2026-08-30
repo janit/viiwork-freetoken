@@ -1,0 +1,58 @@
+# A native systemd unit, which is the recommended shape for this node.
+#
+# The Dockerfile in the repo root works, but FreeToken is an edge-native engine:
+# it wants host RAM, a fast PCIe link and a persistent JIT kernel cache, and a
+# container adds a large image and a set of volume mounts to get back to where
+# a native install already is. Containerise this only if the rest of your fleet
+# is containerised.
+#
+# Copy to /etc/systemd/system/viiwork-freetoken.service and edit the three
+# paths. Then:
+#
+#     systemctl daemon-reload
+#     systemctl enable --now viiwork-freetoken
+#     journalctl -fu viiwork-freetoken
+
+[Unit]
+Description=viiwork-freetoken mesh node (DeepSeek-V4-Flash)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=viiwork
+Group=viiwork
+
+# nvcc must be on PATH at RUN time, not just at install time: FreeToken
+# JIT-compiles its CUDA kernels on first use. A unit that works interactively
+# and fails under systemd is almost always this line missing.
+Environment=PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CUDA_HOME=/usr/local/cuda
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+
+# The kernel cache and the `ft bench bw` profile live under $HOME/.cache. A
+# unit whose user has no writable home recompiles kernels on every start and
+# loses the bandwidth profile that makes --moe-backend auto pick hybrid.
+Environment=HOME=/var/lib/viiwork
+
+ExecStart=/usr/local/bin/viiwork-freetoken --config /etc/viiwork/viiwork-freetoken.yaml
+
+# The node stops accepting first, then stops its backends, so a request in
+# flight finishes against a live engine. Give it room: 60s of shutdown_grace
+# plus the node's own 30s drain.
+KillSignal=SIGTERM
+TimeoutStopSec=180
+
+# A model that cannot load will never load. The node's own max_respawns bounds
+# the inner loop; this bounds the outer one.
+Restart=on-failure
+RestartSec=30s
+
+# Memory is the constraint that bites on an offload MoE backend — the weights
+# live in host RAM. Do NOT set MemoryMax here unless you have measured the
+# steady-state footprint: the OOM killer arriving 18 minutes into a load is a
+# slow way to learn the number. Protect the rest of the box instead.
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=multi-user.target

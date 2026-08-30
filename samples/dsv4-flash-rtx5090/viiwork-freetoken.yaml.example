@@ -1,0 +1,176 @@
+# A single consumer GPU serving a frontier MoE model out of host RAM, joining a
+# mesh over a tailnet.
+#
+# Modelled on a real deployment: one RTX 5090 (32,607 MiB, PCIe gen4 x16, 550 W
+# board limit) in a 64-core EPYC host with 251 GiB of RAM, driver 595.84 and
+# CUDA 13.3, running DeepSeek-V4-Flash-0731 — 156 GB of weights on disk.
+# Addresses and hostnames are placeholders — see ../README.md.
+#
+# The one-line summary of why this file looks the way it does: the model is
+# roughly five times the card. Everything below follows from that.
+
+server:
+  host: 0.0.0.0
+  # 9<model-class><instance>. Class 8 is this model; this is the first host in
+  # its pool.
+  port: 9801
+  mesh_port: 8086
+  cors:
+    # Keep identical across the fleet so one allowlist works for every node.
+    allow_origins: ["*.ts.net", "localhost", "127.0.0.1"]
+    allow_tailnet_ips: true
+
+node:
+  # Explicit rather than left to os.Hostname(): peers dial this node by
+  # address, and per-host dedup on the dashboards keys on this name. Get it
+  # wrong and one machine renders as several — each reporting the same wattage.
+  hostname: gpu1
+
+model:
+  # Must match the other members of the pool exactly. The same name across
+  # nodes is what makes them replicas of one model rather than several.
+  name: DeepSeek-V4-Flash
+  # A local directory, not an HF repo id. At 156 GB across 48 safetensors
+  # shards you want the download to be a separate, resumable step — see
+  # fetch-model.sh — rather than something a respawning backend retries.
+  #
+  # Keep the checkpoint's `inference/` subdirectory: FreeToken reads the
+  # authoritative DeepSeek-V4 model arguments from `inference/config.json`, not
+  # from the top-level one, and a checkout missing it fails at load.
+  #
+  # `ft checkpoint --model <this> --out <ftw dir>` converts once into
+  # FreeToken's FTW fast-load format, and `--model` auto-detects the result.
+  # Worth doing here: every respawn otherwise re-reads 156 GB of safetensors.
+  path: /srv/models/DeepSeek-V4-Flash-0731
+
+gpus:
+  # One card, one backend. Pinned with CUDA_VISIBLE_DEVICES under
+  # CUDA_DEVICE_ORDER=PCI_BUS_ID, so this index means what nvidia-smi says it
+  # means.
+  devices: [0]
+  base_port: 9901
+
+freetoken:
+  # Absolute path into the engine's virtualenv. `ft` on PATH also works, but a
+  # systemd unit has no shell profile to source — see
+  # viiwork-freetoken.service.example.
+  binary: /opt/freetoken/.venv/bin/ft
+
+  # The decisive setting. 156 GB of weights against 31.8 GiB of VRAM: `fused`
+  # is not an option, and the engine would never pick it anyway (auto resolves
+  # MoE models to offload, and upgrades to hybrid given a bench profile).
+  #
+  # Which of the offload family is right is a property of THIS machine, and it
+  # is measurable rather than guessable:
+  #
+  #     ft bench bw            # once per GPU; writes ~/.cache/freetoken/benchbw/<uuid>.json
+  #
+  # It compares host-RAM bandwidth against the PCIe link with the real MoE
+  # kernels and recommends hybrid when the CPU wins by more than 2x. On this
+  # shape of host it usually does — 8-channel DDR4 against a gen4 x16 link is
+  # most of an order of magnitude — but run it before believing that, and leave
+  # this key commented out to let the engine read the profile itself.
+  #
+  #   fused    every expert resident. Needs the VRAM. Not possible here.
+  #   offload  experts in host RAM, LRU cache of hot ones on the card, misses
+  #            stream over PCIe.
+  #   cpu      misses are computed on the CPU instead of fetched.
+  #   hybrid   fetch some misses, compute the rest, overlapped. Needs the bench
+  #            profile to size the split.
+  # moe_backend: hybrid
+
+  # Low, and the engine's own default. Every concurrent slot costs KV capacity
+  # in VRAM that is already contended by the expert cache, and on a model this
+  # size the expert cache is what decides throughput. Raise it only after
+  # watching cache occupancy on the dashboard — /v1/stats reports the pools,
+  # and `ft ctl cache` prints them as a table.
+  max_running_requests: 4
+
+  # The engine measures FREE VRAM, so this is a fraction of what is actually
+  # available rather than of the card. Left at the default; on a card with
+  # nothing else on it there is no reason to give the engine less.
+  memory_ratio: 0.90
+
+  # The checkpoint declares 1,048,576 positions (yarn, factor 16 over a 65,536
+  # base). Do not serve that here. Context competes with the expert cache for
+  # the same VRAM, and on this card the expert cache is the thing paying for
+  # itself. 32k is a working figure; raise it and watch what /v1/stats reports
+  # for the KV pool before keeping the change.
+  max_seq_len: 32768
+
+  # 20m, and not padding. Loading is 156 GB of weights (much less from FTW),
+  # then cache-pool sizing, then CUDA graph capture, then filling a GPU expert
+  # cache from host memory. The node logs each phase as /health reports it, so
+  # a backend that is stuck looks different from one that is merely slow.
+  startup_timeout: "20m"
+  shutdown_grace: "60s"
+
+  extra_args: []
+  #   Everything the engine resolves on its own is deliberately absent here.
+  #   For DeepSeek-V4 that includes the page size (forced to 128), the sparse
+  #   attention backend, and the tool-call and reasoning parsers. Overriding
+  #   any of them is a thing to do with evidence, not by default.
+  #
+  #   Keep a KV floor before the expert cache fills, if you find the engine
+  #   sizing KV smaller than your context needs:
+  # extra_args: ["--kv-reserve-tokens", "32768"]
+
+health:
+  interval: "5s"
+  # 5s rather than the 2s default. The engine answers /health from the same
+  # event loop that serves generations, and a backend mid-prefill on a 43-layer
+  # MoE model can be slow to reply without being unhealthy.
+  timeout: "5s"
+  failure_threshold: 3
+  # A model that cannot load will never load, and an unbounded respawn loop on
+  # a 20-minute startup is a machine busy failing for hours.
+  max_respawns: 3
+
+balancer:
+  latency_window: "30s"
+  high_load_threshold: 7
+  # Left to default to freetoken.max_running_requests. Past it the node returns
+  # 429 rather than queueing, and on this engine that ceiling is genuinely low
+  # — which is the point. A node that queues past what the scheduler will run
+  # is hiding latency the mesh could have routed to another host.
+  # max_in_flight_per_backend: 4
+
+peers:
+  # Static and symmetric by convention: list this node on the peers it lists,
+  # or routing works in one direction only.
+  #
+  # A mixed fleet is the normal case — these are viiwork (AMD llama.cpp) and
+  # viiwork-nvidia (vLLM) nodes. Peers that are down are listed anyway: they
+  # render as unreachable, which is information, and they attach when they
+  # return.
+  hosts:
+    - 100.64.0.10:9101   # gpu2, a chat model on Radeon VII
+    - 100.64.0.10:9301   # gpu2, another model
+    - 100.64.0.11:9601   # gpu3, a vLLM node
+  poll_interval: "10s"
+  timeout: "5s"
+
+activity:
+  prompt_history: 1000
+  # Must comfortably exceed a busy minute's events: a dashboard rebuilds
+  # in-flight state from this replay, and anything that fell off the ring is a
+  # request it cannot learn about.
+  event_history: 2000
+
+# The durable per-host, per-model kWh store.
+#
+# Enable on EXACTLY ONE instance per host. Node wattage is a whole-host
+# measurement, so two recorders on one machine count the same draw twice, and
+# no node can detect that on its own.
+#
+# With no BMC the node figure is the SUM OF PER-GPU BOARD POWER, not a chassis
+# reading. That gap is larger here than on most nodes and worth naming: this
+# workload is deliberately CPU- and memory-heavy — experts are streamed from or
+# computed in host RAM — so a 64-core host under load draws power that a
+# per-GPU sum cannot see at all. The store records "nvidia-smi" as its source
+# label so a history read outside its mesh context still says what it measured;
+# read it as a GPU figure, not a wall figure.
+energy:
+  enabled: true
+  dir: /var/lib/viiwork/energy
+  sample_interval: "30s"

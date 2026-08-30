@@ -1,0 +1,16 @@
+bin/
+viiwork-freetoken.yaml
+docker-compose.yaml
+.env
+*.log
+
+# Local development workspace pointing at a viiwork checkout beside this one.
+# Never published: go.mod must stand on its own in the public repo.
+go.work
+go.work.sum
+
+# Agent and editor state. Untracked in the sibling repos too; listed here
+# because a mind store is a binary file that would otherwise be easy to `git
+# add -A` by accident.
+.claude/
+.serena/

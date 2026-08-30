@@ -1,0 +1,260 @@
+# viiwork-freetoken — a viiwork mesh node backed by FreeToken on NVIDIA GPUs.
+#
+# Copy to viiwork-freetoken.yaml and edit. The real file is gitignored, since it
+# is deployment-specific.
+#
+# Only model.name, model.path and gpus.devices are required; everything else
+# below is shown at its default.
+
+server:
+  host: 0.0.0.0
+  port: 9801
+
+  # mesh_port: a second, well-known port whose "/" is the MESH dashboard.
+  #
+  # It is CONTENDED, not assigned: every node on the host asks for it and the
+  # OS gives it to one, with the losers retrying. That is what makes the fleet
+  # view reachable at one address per host without a designated instance or a
+  # reverse proxy — including when the holder is a viiwork (AMD) node rather
+  # than this one. Keep it identical across the fleet. 0 disables the listener.
+  mesh_port: 8086
+
+  cors:
+    # Browser origins allowed to call this API directly.
+    #
+    # This node authenticates nothing — reachability IS the authorization
+    # model, and the fleet is expected to sit on a tailnet. The allowlist is
+    # not protecting the API from anyone who can already reach it with curl; it
+    # stops a page in a tailnet member's browser from driving the fleet through
+    # that member's network position. Keep it narrow, and put a consuming
+    # application's own origin here rather than in the defaults.
+    #
+    # An explicit empty list ([]) sends no CORS header at all.
+    allow_origins: ["*.ts.net", "localhost", "127.0.0.1"]
+    # Also allow origins addressed by a literal Tailscale IP (100.64.0.0/10,
+    # fd7a:115c:a1e0::/48), since a tailnet is as often browsed by address as
+    # by MagicDNS name.
+    allow_tailnet_ips: true
+
+node:
+  # hostname: the name OTHER hosts resolve this machine by. Defaults to
+  # os.Hostname(). Peers key per-host deduplication on it, so if instances on
+  # this machine are peered by IP, set this to the real hostname or the
+  # dashboard will split one machine into several.
+  # hostname: gpu1
+  #
+  # id: pins the node id across restarts. Left empty a random one is minted,
+  # which is fine — nothing durable is keyed on it.
+  # id: ""
+
+model:
+  # name: the id this node advertises to the mesh and answers requests for.
+  # Must be unique per model across the fleet: two nodes claiming one name are
+  # treated as replicas and load-balanced against each other.
+  name: DeepSeek-V4-Flash
+  # path: what FreeToken loads, passed as --model. A local directory, a
+  # HuggingFace repo id, or a directory in FreeToken's FTW fast-load format,
+  # which the engine detects on its own.
+  #
+  # For anything larger than the card, prefer a local FTW directory: `ft
+  # checkpoint` converts an HF checkpoint once, and every subsequent start
+  # loads from it instead of re-reading safetensors.
+  path: /models/DeepSeek-V4-Flash-NVFP4
+
+gpus:
+  # devices: the physical GPU indices this instance owns, as nvidia-smi numbers
+  # them. Several instances can share a host by taking disjoint slices.
+  #
+  # One backend per device. FreeToken serves one GPU per process, so there is
+  # no tensor_parallel_size to configure here, unlike the vLLM node.
+  #
+  # Each backend is pinned with CUDA_VISIBLE_DEVICES under
+  # CUDA_DEVICE_ORDER=PCI_BUS_ID. That combination is deliberate: the released
+  # engine (0.1.2) has no --gpu flag at all and takes CUDA device 0, while
+  # newer builds add one but still read a preset CUDA_VISIBLE_DEVICES as a
+  # quota — so the environment is the mechanism that works on both. PCI_BUS_ID
+  # is what makes an index here mean the same card nvidia-smi calls it, rather
+  # than CUDA's default fastest-first order.
+  devices: [0]
+
+  # base_port: the first backend port; each subsequent backend takes the next.
+  base_port: 9901
+
+freetoken:
+  # binary: the FreeToken CLI. `ft` is a console script inside the engine's
+  # virtualenv, so this is either "ft" with that venv on PATH, or an absolute
+  # path into its bin/.
+  binary: ft
+  # binary: /home/you/freetoken/.venv/bin/ft
+
+  # max_running_requests: how many requests FreeToken's scheduler runs
+  # concurrently (--max-running-requests). Published as the backend's slot
+  # count, and the default ceiling for backpressure.
+  #
+  # 4 is the engine's own default and is not a placeholder to be raised: on an
+  # edge-native engine every concurrent slot costs KV capacity in a consumer
+  # card's VRAM, competing with the expert cache. Raise it only after watching
+  # what it does to cache occupancy on the dashboard.
+  max_running_requests: 4
+
+  # memory_ratio: the fraction of FREE VRAM the engine may use for weights,
+  # expert cache and KV together (--memory-ratio). Free, not total — a card
+  # already holding another process's allocation is measured as it is. Lower it
+  # if something else shares the GPU.
+  memory_ratio: 0.90
+
+  # moe_backend: how mixture-of-experts layers are executed (--moe-backend).
+  # Omit to let the engine choose, which is usually right.
+  #
+  #   fused    every expert resident in VRAM. The fast path, for a model that
+  #            fits.
+  #   offload  experts live in host RAM and are streamed over PCIe on demand,
+  #            with an LRU cache of the hot ones on the card. This is how a
+  #            290B model runs on a 32GB card.
+  #   cpu      experts are computed on the CPU and never crossed over PCIe.
+  #            Wins when host memory bandwidth beats the PCIe link.
+  #   hybrid   fetch the top experts over PCIe, compute the rest on the CPU.
+  #            Needs a `ft bench bw` profile to size the split; with one, the
+  #            engine will also pick this on its own.
+  #
+  # Run `ft bench bw` once per GPU before deciding: it measures this machine's
+  # host-RAM versus PCIe bandwidth with the real kernels and writes a profile
+  # the engine reads.
+  # moe_backend: offload
+
+  # max_seq_len: --max-seq-len-override, published to the mesh as the backend's
+  # context size. Omit to use the checkpoint's own value, in which case the
+  # mesh reports the context size as unknown rather than as zero.
+  # max_seq_len: 32768
+
+  # startup_timeout: how long a backend may take to report a serving /health.
+  #
+  # Generous on purpose, and more so than the vLLM node's. Loading here is not
+  # only weights and CUDA graphs: on an offload backend the engine then fills a
+  # GPU expert cache from host memory, and the models this engine exists to run
+  # are the ones too large to fit in VRAM. A timeout tuned to a model that fits
+  # produces a permanent respawn loop that looks like a crash and is really
+  # impatience.
+  #
+  # The wait is not silent — /health reports a load phase and a byte count, and
+  # the node logs each phase change — so a backend that is stuck is
+  # distinguishable from one that is merely slow.
+  startup_timeout: "20m"
+  shutdown_grace: "30s"
+
+  # extra_args are appended verbatim, after every generated argument, so they
+  # can always win — argparse takes the last occurrence of a flag.
+  #
+  # This is where the engine's long tail lives. It is deliberately not mirrored
+  # as YAML keys: FreeToken resolves dtype, attention backend, page size, KV
+  # capacity, CUDA-graph sizes and the tool-call and reasoning parsers from the
+  # checkpoint and the GPU, and does it better than a config file can.
+  extra_args: []
+  #   Pin the attention backend rather than letting the engine pick:
+  # extra_args: ["--attention-backend", "trtllm"]
+  #   Cap the GPU expert cache as a fraction of all experts, instead of letting
+  #   it size itself from free VRAM:
+  # extra_args: ["--moe-cache-rate", "0.25"]
+  #   Keep a KV floor before the expert cache fills:
+  # extra_args: ["--kv-reserve-tokens", "16384"]
+  #   Reasoning models: the engine infers the parser from the model family, so
+  #   this is only for overriding that or turning it off.
+  # extra_args: ["--reasoning-parser", "off"]
+
+health:
+  interval: "5s"
+  timeout: "2s"
+  # failure_threshold: consecutive failed probes before a respawn. A hard
+  # socket failure on the inference path (EOF, connection refused) skips this
+  # ladder, since the process is definitively gone.
+  failure_threshold: 3
+  # max_respawns: a model that cannot load will never load, and an unbounded
+  # respawn loop turns that into a machine permanently busy failing.
+  max_respawns: 3
+
+balancer:
+  latency_window: "30s"
+  # high_load_threshold: below this many in-flight requests on the node, prefer
+  # the lowest-latency IDLE backend; at or above it, prefer the least loaded.
+  high_load_threshold: 7
+  # max_in_flight_per_backend: the backpressure ceiling, past which the node
+  # returns 429. Defaults to freetoken.max_running_requests, because the
+  # engine's own scheduler queue is the real constraint and a lower number just
+  # leaves the GPU idle.
+  #
+  # On this engine that default is small, so the ceiling bites in normal
+  # operation rather than only under abuse. That is the intended behaviour: a
+  # node that queues past what the scheduler will run is hiding latency the
+  # mesh could have routed around. Raise it only together with
+  # freetoken.max_running_requests.
+  # max_in_flight_per_backend: 4
+
+# Mesh: list the other nodes — viiwork, viiwork-nvidia and viiwork-freetoken
+# alike. Peering is static and symmetric by convention: list this node on the
+# peers it lists, or routing works in only one direction.
+# peers:
+#   hosts:
+#     - gb1:9302
+#     - gb1:9102
+#     - gb2:9601
+#   poll_interval: "10s"
+#   timeout: "3s"
+
+activity:
+  # prompt_history: how many request prompts and outputs to keep in memory.
+  # Published to the mesh so the dashboard sizes its own list from this number
+  # rather than keeping a second copy that can drift. Nothing is persisted.
+  prompt_history: 1000
+  # event_history: the activity ring replayed to a dashboard on connect. It
+  # must comfortably exceed a busy minute's events — a consumer rebuilds
+  # in-flight state from the replay, and anything that fell off the ring is a
+  # request it cannot learn about.
+  event_history: 2000
+
+# energy: the durable per-host, per-model kWh store.
+#
+# Disabled by default. Two reasons, and the second is the one that bites:
+#
+#   - It needs a writable directory that outlives the container, which no
+#     default can invent.
+#   - Node wattage is a WHOLE-HOST measurement. A host running several
+#     instances must enable this on exactly ONE of them, or the same draw is
+#     recorded several times over. A node cannot detect that on its own.
+#
+# The store, its on-disk format and all the bucketing come from viiwork's
+# public `energy` package rather than being reimplemented here, so a host that
+# changes implementation keeps its history in place. What differs is only where
+# the wattage comes from:
+#
+# viiwork measures the chassis over IPMI/DCMI — CPU, fans, drives and PSU
+# losses included, ~400W on an idle 10-GPU host. There is no uniform BMC across
+# the NVIDIA hosts, so this node publishes the SUM OF PER-GPU BOARD POWER
+# instead, which excludes all of that and understates the wall figure
+# substantially. That is a deliberate trade rather than an estimate to be
+# improved by guessing: an operator-supplied overhead constant would put a
+# fabricated number into a field measured everywhere else in the fleet, and a
+# wrong guess disappears the moment it is summed into a fleet total.
+#
+# What keeps it honest is the label. This node records "nvidia-smi" as the
+# store's source and publishes it as meshapi's power_source, so neither a
+# dashboard nor a history directory copied off the host can mistake a GPU sum
+# for a chassis reading.
+#
+# Because the node figure IS the sum of the per-GPU readings, there is no
+# aggregate to divide and no baseline to recover: each card is charged its own
+# measured draw (energy.Direct), the shares reconcile with the node total
+# exactly, and the baseline is honestly zero.
+# energy:
+#   enabled: false
+#   dir: /var/lib/viiwork/energy
+#   # Records are always one per minute. Sampling faster and averaging is what
+#   # keeps a card swinging between idle and load from being misrepresented by
+#   # whichever instant the sample landed on.
+#   sample_interval: "30s"
+#   # Ring geometry — compatibility surface, not tunables. The format is shared
+#   # with viiwork, and changing a slot count recreates the rings and discards
+#   # the history they held. Defaults give 24h of minutes and a year of hours
+#   # and days in a couple of megabytes, preallocated.
+#   minute_slots: 1440
+#   hour_slots: 8760
+#   day_slots: 365
