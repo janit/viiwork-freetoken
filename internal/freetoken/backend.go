@@ -55,6 +55,11 @@ type Backend struct {
 	// health is the last /health document read, kept so the manager can say
 	// what a not-yet-ready backend is actually doing.
 	health Health
+	// ctxLearned records that the served context length has been read from the
+	// engine, so it is asked once per process rather than on every tick. It is
+	// a property of the loaded checkpoint and cannot change while the process
+	// lives.
+	ctxLearned bool
 
 	client *http.Client
 	logOut io.Writer
@@ -187,6 +192,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	b.started = time.Now()
 	b.failures = 0
 	b.health = Health{}
+	b.ctxLearned = false
 	b.State.SetStatus(balancer.StatusStarting)
 	// Publish the configured shape now rather than waiting for a scrape: these
 	// are what we told FreeToken to do, so they are known from the moment it is
@@ -283,15 +289,99 @@ func (b *Backend) Probe(ctx context.Context) bool {
 	h, ok := b.readHealth(ctx)
 
 	b.mu.Lock()
+	prev := b.health
 	b.health = h
+	// A live cache rebuild resizes the KV pool, which moves the context
+	// ceiling. Coming out of one invalidates what we learned.
+	if prev.Maintenance != "" && prev.Maintenance != maintServing && h.Ready() {
+		b.ctxLearned = false
+	}
 	b.mu.Unlock()
 
 	if !ok || !h.Ready() {
 		return false
 	}
 	b.refreshStats(ctx)
+	b.learnContextLen(ctx)
 	b.State.SetRSSMB(readRSSMB(b.pid()))
 	return true
+}
+
+// learnContextLen publishes the context this backend will actually accept, when
+// the config did not pin one. Once per engine generation.
+//
+// Start already published freetoken.max_seq_len, which is the operator's answer
+// and always wins. This covers the case where they gave none — the right
+// default, since the checkpoint's own limit is usually what you want and
+// restating it in YAML is a second place to get it wrong.
+//
+// The number published is the SMALLER of what the checkpoint allows and what
+// the engine's KV pool holds, because that is the one a request is measured
+// against. Those are not close on the hardware this node exists for: the engine
+// sizes KV from the VRAM left after weights and the expert cache, so serving a
+// model several times the size of the card leaves a pool far below the
+// checkpoint's limit. Measured on an RTX 5090 serving DeepSeek-V4-Flash,
+// /v1/models advertises 1,048,576 tokens and the backend rejects anything over
+// 64,128. Publishing the advertised figure would put a number on the dashboard
+// that the backend refuses, which is worse than a blank — a client would size a
+// request by it and get a 400.
+//
+// Both reads are best-effort. A missing one narrows the answer rather than
+// voiding it; only when neither is available is nothing published.
+func (b *Backend) learnContextLen(ctx context.Context) {
+	if b.Engine.MaxSeqLen > 0 {
+		return
+	}
+	b.mu.Lock()
+	done := b.ctxLearned
+	b.mu.Unlock()
+	if done {
+		return
+	}
+
+	var limit int64
+	if body, ok := b.get(ctx, "/v1/models"); ok {
+		if n, ok := ParseContextLen(body); ok {
+			limit = n
+		}
+	}
+	if body, ok := b.get(ctx, "/v1/cache/status"); ok {
+		if n, ok := ParseKVCapacity(body); ok && (limit == 0 || n < limit) {
+			limit = n
+		}
+	}
+
+	b.mu.Lock()
+	// Latched either way: an engine that did not answer will not start
+	// answering mid-generation, and retrying every tick would poll a
+	// control-plane endpoint forever for a number that is not coming.
+	b.ctxLearned = true
+	b.mu.Unlock()
+	if limit > 0 {
+		b.State.SetMaxModelLen(limit)
+	}
+}
+
+// get is a bounded GET against this backend. Used for the control-plane reads
+// that are not on the health path.
+func (b *Backend) get(ctx context.Context, path string) ([]byte, bool) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://"+b.Addr()+path, nil)
+	if err != nil {
+		return nil, false
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+	if err != nil {
+		return nil, false
+	}
+	return body, true
 }
 
 func (b *Backend) readHealth(ctx context.Context) (Health, bool) {

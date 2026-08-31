@@ -92,10 +92,15 @@ freetoken:
   memory_ratio: 0.90
 
   # The checkpoint declares 1,048,576 positions (yarn, factor 16 over a 65,536
-  # base). Do not serve that here. Context competes with the expert cache for
-  # the same VRAM, and on this card the expert cache is the thing paying for
-  # itself. 32k is a working figure; raise it and watch what /v1/stats reports
-  # for the KV pool before keeping the change.
+  # base), and the engine will happily serve that — it is what the bare unit
+  # this sample replaced was doing. Capping it is a choice: context competes
+  # with the expert cache for the same VRAM, and on this card the expert cache
+  # is what decides throughput.
+  #
+  # Omit the key entirely to serve the checkpoint's limit; the node asks the
+  # engine for the resolved number and publishes it either way, so the mesh
+  # shows a real context size in both cases. 32k is a working figure — raise it
+  # and watch what `ft ctl cache` reports for the KV pool before keeping it.
   max_seq_len: 32768
 
   # 20m, and not padding. Loading is 156 GB of weights (much less from FTW),

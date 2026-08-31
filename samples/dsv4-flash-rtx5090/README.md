@@ -65,16 +65,21 @@ install -m644 viiwork-freetoken.yaml /etc/viiwork/
 systemctl enable --now viiwork-freetoken && journalctl -fu viiwork-freetoken
 ```
 
-Expect the first start to take many minutes, and the *very* first to take
-longer still: FreeToken JIT-compiles its CUDA kernels on first use. The node
-logs each load phase as `/health` reports it, so you can tell progress from a
-hang:
+Expect minutes, and the *very* first start longer still: FreeToken JIT-compiles
+its CUDA kernels on first use. The node logs each load phase as `/health`
+reports it, so you can tell progress from a hang. Measured on this hardware,
+from a warm kernel cache and unconverted safetensors:
 
 ```
-[gpu-0] loading (weights, 34%)
-[gpu-0] loading (cuda_graphs)
-[gpu-0] gpu-0 healthy
+[manager] gpu-0 spawned (pid 196029, GPU [0], port 9901)
+[manager] gpu-0 loading (other)                     +5s
+[manager] gpu-0 loading (expert_banks, 2%)         +20s
+[manager] gpu-0 loading (warmup)                  +1m55s
+[manager] gpu-0 healthy                           +2m00s
 ```
+
+`expert_banks` is the long pole and the one to watch: it is the 156 GB going
+into host RAM.
 
 Then:
 
@@ -83,6 +88,88 @@ curl -s localhost:9801/v1/models
 curl -s localhost:9801/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"DeepSeek-V4-Flash","messages":[{"role":"user","content":"hi"}]}'
 ```
+
+## Measured
+
+One uncontended run on the machine above, through the node rather than against
+the engine, so the figures include what the proxy costs. FreeToken 0.1.2,
+`--moe-backend` auto-resolved to `hybrid`, safetensors (not FTW).
+
+| | |
+| --- | --- |
+| Decode, single stream | **24.5 tok/s** |
+| Decode, 4 concurrent | **51.1 tok/s** aggregate (12.8 per stream) |
+| Prefill, marginal | **~1,000 tok/s** |
+| Servable context | **64,128 tokens** |
+| Power, idle → load | **13.4 W → 195 W** on a 550 W card |
+| Energy, 4 concurrent | **3.8 J/token** |
+| VRAM / host RAM | 29.4 GB of 32.6 / 148 GB of 251 |
+
+Side by side with Qwen3.8-Flash-Next on the same card, plus the
+context-vs-expert-cache trade: [`../benchmarks`](../benchmarks/).
+
+Five things in that table are worth more than the number itself.
+
+**The GPU is not the bottleneck.** A 5090 is a 550 W card and this workload
+draws 195 W, peaking at 230. That is the signature of `hybrid`: most of each
+decode step is host memory and CPU, with 17.7% of expert misses crossing PCIe.
+Undervolting or a lower power cap costs nothing here; more system memory
+bandwidth would help.
+
+**Concurrency is nearly free after the second stream.** Per-stream throughput
+halves going from one stream to two — 24.6 to 13.7 — and then barely moves
+going to four, 13.7 to 12.8. So aggregate throughput doubles from 1 to 4
+concurrent while each caller sees roughly half the tokens per second. Energy
+per token improves in step, 7.8 J to 3.8 J.
+
+**The fifth concurrent request is refused, not queued.** At concurrency 8, four
+requests completed and four came back 429, with aggregate throughput unchanged.
+That is `max_in_flight_per_backend` defaulting to the engine's
+`--max-running-requests` of 4. In a mesh that is what you want — another node
+takes the request. On a single node with no peers it is a behaviour change from
+running `ft serve` bare, which would have queued them.
+
+**The prefix cache is the difference between usable and not.** A repeat prompt
+is served in ~5.2 s *regardless of length*: 32k tokens costs 37.4 s cold and
+5.3 s warm. For an agent replaying a long conversation this is the whole
+experience.
+
+| Prompt | Cold | Warm |
+| ---: | ---: | ---: |
+| 2,000 tok | 6.4 s | 5.2 s |
+| 7,979 tok | 11.2 s | 5.2 s |
+| 31,998 tok | 37.4 s | 5.3 s |
+
+There is a ~5.2 s floor under every first token, which is why the marginal
+prefill rate (~1,000 tok/s, from the slope) is the honest figure rather than
+prompt ÷ TTFT.
+
+**The advertised context is not the servable one, and the gap is 16x.**
+
+```
+/v1/models advertises   1,048,576 tokens
+the backend accepts        64,128 tokens
+   62,975 tok -> 200 OK
+   70,590 tok -> 400 context_length_exceeded
+                 "70590 tokens > 64128 maximum (prompt + generation)"
+```
+
+64,128 is the KV pool: 501 pages x 128. The engine sizes it from the VRAM left
+after the weights and the expert cache, so on a card serving a model five times
+its size the pool is a small fraction of what the checkpoint allows. The node
+publishes the servable number to the mesh for exactly this reason.
+
+You can buy context back, at a price the same table shows you:
+
+```sh
+ft ctl cache --kv 200000     # KV is resizable 3,968 .. 2,802,310 tokens
+```
+
+The budget is shared. Today it is 19.3 GB split as 15.4 GB of expert cache
+(1,239 of 11,008 slots, 11.3%), 1.7 GB of full-attention window and 0.4 GB of
+KV. KV is cheap per token here — 6.9 KB against 136 KB for the window pool — so
+a large context increase costs expert slots, and expert slots are what the
+throughput above is made of. Measure both sides before keeping the change.
 
 ## Choosing the MoE backend, which is the whole deployment
 
@@ -101,7 +188,21 @@ bandwidth beats the PCIe link — and it is measurable rather than arguable:
 
 ```sh
 ft bench bw            # writes ~/.cache/freetoken/benchbw/<gpu-uuid>.json
+                       # (older engines: a single ~/.cache/freetoken/benchbw.json,
+                       #  still honoured when the GPU name matches)
 ```
+
+You can confirm it took effect. The engine says so at startup, and the node
+passes its output through:
+
+```
+benchbw profile recommends hybrid for 'ds_fp4' experts on this GPU
+Auto-selected MoE backend: hybrid
+--moe-hybrid-max-fetch auto: fetching 17.7% of each decode step's expert
+  misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU
+```
+
+If you see `offload` there instead, the profile was not found — check `HOME`.
 
 It runs the real MoE kernels against both paths and recommends `hybrid` when
 the CPU wins by more than 2x. On a host of this shape — 8-channel DDR4 against
@@ -137,6 +238,39 @@ you see the trade land:
 
 Neither has a right answer that a config file can carry: measure with your
 model and your traffic.
+
+## Verified on this host
+
+Behaviours worth knowing before you rely on them, each exercised against the
+real engine rather than a test double.
+
+**A crashed engine recovers on its own.** `kill -9` on the `ft` process:
+
+```
+request during the outage        ->  HTTP 503
+[manager] gpu-0 respawning (attempt 1/3)
+[manager] gpu-0 loading (expert_banks, 2%)
+[manager] gpu-0 healthy                       ~210 s after the kill
+```
+
+A 503, not a hang and not a 500 — the node drops the backend out of the picker
+the moment a probe fails, and answers honestly while there is nothing to route
+to. Recovery costs a full model load, which is why `max_respawns` is bounded: a
+model that cannot load would otherwise keep the machine busy failing for hours.
+
+**No orphaned workers.** After the kill and respawn, `nvidia-smi` shows exactly
+one compute process holding 29,146 MiB. FreeToken runs its scheduler, tokenizer
+and detokenizer as separate processes, so the node signals the process *group*;
+signalling the pid alone leaves those resident, holding VRAM, and the respawn
+then fails for want of memory.
+
+**Both engine builds work, unchanged.** The same node config was run against
+the PyPI release (0.1.2, which has no `--gpu` flag at all) and against a source
+build of `main` (which has one). Identical behaviour in both: the same
+`hybrid` backend selected from the bench profile, the same servable context
+published, working inference. That is the point of pinning the card through
+`CUDA_VISIBLE_DEVICES` instead of the flag — see the Dockerfile and
+`internal/freetoken.Backend.Env`.
 
 ## Why not the container
 

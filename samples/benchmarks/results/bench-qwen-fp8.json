@@ -1,0 +1,199 @@
+{
+  "model": "Qwen3.8-Flash-Next-FP8",
+  "captured": "2026-08-30T22:46:55Z",
+  "facts": {
+    "node_slot_ctx": 8320,
+    "node_slot_count": 4,
+    "advertised_ctx": 262144,
+    "geometry": {
+      "num_pages": 130,
+      "page_size": 64,
+      "moe_cache_size": 3349,
+      "num_mamba_slots": 24,
+      "num_experts": 512,
+      "num_moe_layers": 48,
+      "moe_cache_policy": "lru",
+      "unit_bytes": {
+        "kv_per_token": 25344,
+        "moe_per_expert": 4915840,
+        "mamba_per_slot": 115642376,
+        "swa_per_token": 0
+      },
+      "swa_full_tokens_ratio": 0.0,
+      "swa_page_size": 0,
+      "num_swa_pages": 0,
+      "cache_budget_bytes": 19566552678,
+      "reasoning": {
+        "gears": [
+          "off",
+          "low",
+          "medium",
+          "xhigh"
+        ],
+        "default": "xhigh",
+        "kwargs": {
+          "off": {
+            "enable_thinking": false,
+            "thinking_mode": "disabled"
+          },
+          "low": {
+            "enable_thinking": true,
+            "thinking_mode": "enabled",
+            "reasoning_effort": "low"
+          },
+          "medium": {
+            "enable_thinking": true,
+            "thinking_mode": "enabled",
+            "reasoning_effort": "medium"
+          },
+          "xhigh": {
+            "enable_thinking": true,
+            "thinking_mode": "enabled",
+            "reasoning_effort": "xhigh"
+          }
+        }
+      },
+      "limits": {
+        "kv_tokens": {
+          "min": 64,
+          "max": 772038
+        },
+        "moe_experts": {
+          "min": 512,
+          "max": 3980
+        },
+        "mamba_slots": {
+          "min": 16,
+          "max": 169
+        },
+        "swa_tokens": {
+          "min": 0,
+          "max": 0
+        }
+      }
+    },
+    "vram_total_mb": 32607,
+    "vram_used_mb": 29396,
+    "host_mem_total_mb": 257529,
+    "host_mem_used_mb": 176634,
+    "kv_capacity_tokens": 8320
+  },
+  "idle_power_w": {
+    "mean": 13.4,
+    "peak": 13.8
+  },
+  "tokens_per_word": 2.28,
+  "prefill": [
+    {
+      "target": 64,
+      "actual_tokens": 59,
+      "ttft_cold_s": 6.69,
+      "ttft_warm_s": 4.28,
+      "prefill_tps": 9
+    },
+    {
+      "target": 2000,
+      "actual_tokens": 2039,
+      "ttft_cold_s": 5.61,
+      "ttft_warm_s": 4.29,
+      "prefill_tps": 364
+    },
+    {
+      "target": 8000,
+      "actual_tokens": 7934,
+      "ttft_cold_s": 4.35,
+      "ttft_warm_s": 4.31,
+      "prefill_tps": 1823
+    },
+    {
+      "target": 32000,
+      "actual_tokens": 31464,
+      "ttft_cold_s": null,
+      "ttft_warm_s": null
+    }
+  ],
+  "decode_single": {
+    "tokens": [
+      511,
+      511,
+      510
+    ],
+    "tps_median": 34.4,
+    "ttft_s": 4.29,
+    "power_w": {
+      "mean": 177.5,
+      "peak": 247.7
+    }
+  },
+  "concurrency": [
+    {
+      "concurrency": 1,
+      "completed": 1,
+      "rejected": 0,
+      "wall_s": 15.7,
+      "tokens_total": 383,
+      "aggregate_decode_tps": 33.6,
+      "per_stream_tps": 33.6,
+      "power_w": {
+        "mean": 172.3,
+        "peak": 203.2
+      },
+      "joules_per_token": 5.1
+    },
+    {
+      "concurrency": 2,
+      "completed": 2,
+      "rejected": 0,
+      "wall_s": 25.6,
+      "tokens_total": 766,
+      "aggregate_decode_tps": 44.7,
+      "per_stream_tps": 22.4,
+      "power_w": {
+        "mean": 159.9,
+        "peak": 202.6
+      },
+      "joules_per_token": 3.6
+    },
+    {
+      "concurrency": 4,
+      "completed": 4,
+      "rejected": 0,
+      "wall_s": 33.7,
+      "tokens_total": 1532,
+      "aggregate_decode_tps": 63.9,
+      "per_stream_tps": 16.0,
+      "power_w": {
+        "mean": 167.4,
+        "peak": 221.6
+      },
+      "joules_per_token": 2.6
+    },
+    {
+      "concurrency": 8,
+      "completed": 4,
+      "rejected": 4,
+      "wall_s": 34.6,
+      "tokens_total": 1532,
+      "aggregate_decode_tps": 58.7,
+      "per_stream_tps": 14.7,
+      "power_w": {
+        "mean": 164.6,
+        "peak": 208.4
+      },
+      "joules_per_token": 2.8
+    }
+  ],
+  "context": {
+    "kv_capacity_tokens": 8320,
+    "advertised": 262144,
+    "just_under": {
+      "actual_tokens": 8036,
+      "status": 200
+    },
+    "just_over": {
+      "actual_tokens": 8996,
+      "status": 400,
+      "err": "{\"error\":{\"message\":\"prompt is too long: 8996 tokens > 8320 maximum (prompt + generation); shorten the prompt or increase the KV cache budget\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"context_length_exceeded\"}"
+    }
+  }
+}

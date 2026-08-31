@@ -6,6 +6,7 @@ placeholder — see "Placeholders" below before copying anything.
 | Sample | What it is |
 | --- | --- |
 | [`dsv4-flash-rtx5090/`](dsv4-flash-rtx5090/) | A complete single-GPU deployment of a 156 GB model on a 32 GB card: config, systemd unit, model fetch, and how to pick the MoE backend. |
+| [`benchmarks/`](benchmarks/) | Tested models and the hardware they were measured on: throughput, servable context, the context-vs-expert-cache trade, and why FP8 gets the slower MoE backend. |
 | [`energy-dump/`](energy-dump/) | Reads a durable energy store and prints what is in it, including the per-model split that never crosses the wire. |
 
 ## Placeholders

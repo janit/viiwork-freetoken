@@ -181,3 +181,92 @@ func TestLoadingWithoutProgressStillDescribesPhase(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// --- /v1/models ----------------------------------------------------------
+
+// Captured from the live engine: FreeToken 0.1.2 serving DeepSeek-V4-Flash.
+const liveModels = `{"object":"list","data":[{"id":"DeepSeek-V4-Flash","object":"model","created":1788116321,"owned_by":"FreeToken","root":"/srv/models/DeepSeek-V4-Flash-0731","max_model_len":1048576,"context_length":1048576,"supported_reasoning_efforts":["max","high","low"],"default_reasoning_effort":"low"}]}`
+
+func TestParseContextLen(t *testing.T) {
+	got, ok := ParseContextLen([]byte(liveModels))
+	if !ok || got != 1048576 {
+		t.Errorf("got %d, %v — want the engine's own context length", got, ok)
+	}
+}
+
+// The engine emits both spellings; a build that drops either must not silently
+// produce a blank context on the dashboard.
+func TestParseContextLenAcceptsEitherSpelling(t *testing.T) {
+	for _, body := range []string{
+		`{"data":[{"context_length":32768}]}`,
+		`{"data":[{"max_model_len":32768}]}`,
+	} {
+		if got, ok := ParseContextLen([]byte(body)); !ok || got != 32768 {
+			t.Errorf("%s: got %d, %v", body, got, ok)
+		}
+	}
+}
+
+func TestParseContextLenAbsent(t *testing.T) {
+	for _, body := range []string{`{"data":[]}`, `{"data":[{"id":"m"}]}`, `nonsense`} {
+		if _, ok := ParseContextLen([]byte(body)); ok {
+			t.Errorf("%s must not yield a context length", body)
+		}
+	}
+}
+
+// --- recorded from a live engine -----------------------------------------
+//
+// Captured verbatim from FreeToken 0.1.2 serving DeepSeek-V4-Flash on an RTX
+// 5090. Hand-written fixtures encode what you believe the engine emits; these
+// encode what it does. Worth keeping precisely because this model contradicted
+// an easy assumption: it reports kv AND swa pools at once, so a reader that
+// looked only at kv would have shown a permanent zero for the one model this
+// node exists to serve.
+
+const liveHealth = `{"status":"ok","model":"DeepSeek-V4-Flash","instance_id":"2d5e3277-a6af-4b89-af99-d2bae5e95375","uptime_s":27261,"maintenance":"serving","version":"0.1.2"}`
+
+const liveStats = `{"instance_id":"2d5e3277-a6af-4b89-af99-d2bae5e95375","model":{"id":"DeepSeek-V4-Flash","ctx":1048576,"attn":"mha","moe":true,"sampling":{"temperature":1.0,"top_p":1.0}},"uptime_s":27261,"kv":{"used_pages":0,"total_pages":501,"page_size":1},"mamba":null,"swa":{"used_pages":0,"total_pages":100,"page_size":128},"vram_bytes":31859933184,"throughput":{"decode_tps":0.0,"prefill_tps":0.0},"requests":{"active":0,"completed":34,"p95_ms":104563,"ttft_mean_ms":5969,"prompt_tokens_total":1134981,"completion_tokens_total":18485}}`
+
+func TestLiveEngineDocuments(t *testing.T) {
+	h, ok := ParseHealth([]byte(liveHealth))
+	if !ok {
+		t.Fatal("the live health document must parse")
+	}
+	if !h.Ready() {
+		t.Errorf("a serving engine must read as ready: %+v", h)
+	}
+
+	s, ok := ParseStats([]byte(liveStats))
+	if !ok {
+		t.Fatal("the live stats document must parse")
+	}
+	// Both pools at once. This is the case the multi-pool maximum exists for.
+	if !s.Found["kv"] || !s.Found["swa"] {
+		t.Errorf("DSV4 reports both kv and swa: %v", s.Found)
+	}
+	if s.Found["mamba"] {
+		t.Error("mamba is null here and must not be marked found")
+	}
+	if s.VRAMBytes != 31859933184 {
+		t.Errorf("vram: got %d", s.VRAMBytes)
+	}
+}
+
+// Recorded from the live engine's /v1/cache/status. The 64,128 this yields is
+// the exact figure the backend names when it refuses a longer prompt:
+// "prompt is too long: 70175 tokens > 64128 maximum (prompt + generation)".
+const liveCacheStatus = `{"state":"serving","last_rebuild":null,"geometry":{"num_pages":501,"page_size":128,"moe_cache_size":1239,"num_mamba_slots":0,"num_experts":256,"num_moe_layers":43,"moe_cache_policy":"lru","unit_bytes":{"kv_per_token":6888,"moe_per_expert":13369344,"mamba_per_slot":0,"swa_per_token":139392},"swa_full_tokens_ratio":0.2,"swa_page_size":128,"num_swa_pages":100,"cache_budget_bytes":19302311526}}`
+
+func TestLiveKVCapacity(t *testing.T) {
+	got, ok := ParseKVCapacity([]byte(liveCacheStatus))
+	if !ok || got != 64128 {
+		t.Errorf("got %d, %v — want the 64128 the engine enforces", got, ok)
+	}
+	// And it must be the smaller of the two: /v1/models on the same engine
+	// advertises 1,048,576, sixteen times what the backend accepts.
+	adv, _ := ParseContextLen([]byte(liveModels))
+	if adv <= got {
+		t.Errorf("this test is pointless unless the advertised %d exceeds the servable %d", adv, got)
+	}
+}

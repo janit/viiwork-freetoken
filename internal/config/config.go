@@ -151,9 +151,15 @@ type FreeTokenConfig struct {
 	// express "let the engine decide".
 	ExtraArgs []string `yaml:"extra_args"`
 	// MaxSeqLen is FreeToken's --max-seq-len-override, published to the mesh as
-	// the backend's context size. Zero leaves the checkpoint's own limit in
-	// place, and the mesh then reports the context size as unknown rather than
-	// as zero.
+	// the backend's context size.
+	//
+	// Zero is the good default, not a gap: the checkpoint's own limit is
+	// usually what you want, and restating it here is a second place to get it
+	// wrong. It costs the mesh nothing, because a backend that answers a probe
+	// is asked for its context length once and that is published instead — see
+	// freetoken.Backend.learnContextLen. Set this only to serve LESS context
+	// than the checkpoint allows, which on a card where the expert cache is
+	// competing for the same VRAM is a real thing to want.
 	MaxSeqLen int `yaml:"max_seq_len"`
 	// MaxRunningRequests is FreeToken's --max-running-requests: how many
 	// requests its scheduler will run concurrently. Published as the backend's

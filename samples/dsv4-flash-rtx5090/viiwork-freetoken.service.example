@@ -30,12 +30,24 @@ Environment=PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/u
 Environment=CUDA_HOME=/usr/local/cuda
 Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
 
-# The kernel cache and the `ft bench bw` profile live under $HOME/.cache. A
-# unit whose user has no writable home recompiles kernels on every start and
-# loses the bandwidth profile that makes --moe-backend auto pick hybrid.
-Environment=HOME=/var/lib/viiwork
+# HOME is load bearing, and quietly so. `ft bench bw` writes its profile under
+# $HOME/.cache/freetoken, and that profile is the ONLY thing that makes
+# --moe-backend auto resolve to `hybrid` instead of `offload`. Point HOME
+# somewhere the profile is not and the node serves the slower backend forever,
+# with nothing in the log to say why. The JIT kernel cache lives beside it, so
+# the same mistake also recompiles kernels on every start.
+#
+# Point it at the home the profile was benched in.
+Environment=HOME=/home/viiwork
 
 ExecStart=/usr/local/bin/viiwork-freetoken --config /etc/viiwork/viiwork-freetoken.yaml
+
+# For the ENGINE, not for the node. The node is a Go process that spawns `ft`
+# and inherits these to it; the engine pins host memory to stage expert weights
+# for the offload/hybrid backends, and a default 8 MB memlock ceiling turns that
+# into a failure minutes into a load. Carried from a working bare-engine unit.
+LimitMEMLOCK=infinity
+LimitNOFILE=65535
 
 # The node stops accepting first, then stops its backends, so a request in
 # flight finishes against a live engine. Give it room: 60s of shutdown_grace

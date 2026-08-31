@@ -11,10 +11,11 @@ implementation of the same mesh protocol, alongside
 
 What FreeToken adds to the fleet is a different *class* of node. vLLM and
 llama.cpp both want the model to fit the hardware. FreeToken is an edge-native
-MoE engine: expert weights live in host RAM and are streamed over PCIe or
-computed on the CPU, so a 290B-parameter model runs on a gaming card. A host
-like that joins the mesh as a peer and serves a model no other node in the fleet
-can hold.
+MoE engine: expert weights live in host RAM and are either streamed over PCIe or
+computed on the CPU, so the card only ever holds a cache of the hot ones. On the
+host this was built against that means a 156 GB checkpoint served from 32 GB of
+VRAM, at 24.5 tok/s. Such a host joins the mesh as a peer and serves a model no
+other node in the fleet can hold.
 
 It is a **separate repository on purpose**. The node types differ where the
 hardware and the inference engine differ — and nowhere else.
@@ -43,8 +44,11 @@ hardware and the inference engine differ — and nowhere else.
   `CUDA_VISIBLE_DEVICES`, with health checks, bounded respawns and graceful
   shutdown.
 - Reads readiness from FreeToken's `/health` **document**, not its status code,
-  so a model spending twenty minutes loading is never advertised to the mesh as
-  ready — and logs the load phase while it waits.
+  so a model still loading is never advertised to the mesh as ready — and logs
+  each load phase (`expert_banks`, `warmup`, …) while it waits.
+- Publishes the context the backend will actually **accept**, not the one the
+  checkpoint advertises. Those differ by 16x on one of the models measured
+  here, and the advertised figure is one a client would get a 400 for.
 - Load-balances across local backends, and across the mesh by model name.
 - Publishes `/v1/status` and `/v1/cluster` in the mesh wire format, so viiwork
   nodes see it as a peer.
@@ -56,6 +60,47 @@ hardware and the inference engine differ — and nowhere else.
 - Optionally records a durable per-host, per-model kWh history, using viiwork's
   shared `energy` package rather than a second implementation of it.
 - Records recent prompts and outputs in memory for the dashboard's prompt view.
+
+## What this achieves
+
+One RTX 5090 — a gaming card with 32 GB — serving frontier MoE checkpoints
+several times its own size, as a full member of the mesh. Measured through the
+node on that host, with FreeToken's `hybrid` backend keeping experts in system
+memory:
+
+| | DeepSeek-V4-Flash | Qwen3.8-Flash-Next |
+| --- | ---: | ---: |
+| Checkpoint | 156 GB | 126 GB (NVFP4) |
+| Decode, single stream | 24.5 tok/s | **53.8 tok/s** |
+| Decode, 4 concurrent | 51.1 tok/s | **147 tok/s** |
+| Servable context, default | 64,128 | 8,192 |
+| ...and reconfigured | — | **262,144**, for 11% throughput |
+| Power under load | 195 W | 229 W (card limit 550 W) |
+| Energy at 4 concurrent | 3.8 J/tok | 1.6 J/tok |
+
+The card is not the constraint — 195-230 W of a 550 W budget, because most of a
+decode step is host memory and CPU. What you need is **system RAM**: the experts
+have to live somewhere, and that host has 251 GB.
+
+Three results worth reading twice:
+
+- **Advertised context is not servable context.** Both models advertise far more
+  than the backend accepts, because the engine sizes its KV pool from the VRAM
+  left after the expert cache — 1,048,576 vs 64,128 for DeepSeek, 262,144 vs
+  8,192 for Qwen. The node publishes the servable figure to the mesh, so the
+  dashboard shows a number a client can actually use.
+- **Context is cheap to buy back.** `ft ctl cache --kv 262144 --moe 3000` gets
+  Qwen its full 262k window at an 11% throughput cost, live, with no restart.
+- **Quantisation decides which MoE backend you get.** The same Qwen model as
+  FP8 is 2.3x slower under concurrency than its NVFP4 conversion, on 50 GB more
+  host RAM — the CPU expert kernel has no fp8_block path, so `hybrid` is
+  unavailable and every miss crosses PCIe. `ft bench bw` predicts this in two
+  minutes without either checkpoint present.
+
+**[`samples/benchmarks`](samples/benchmarks/)** — which models have been tested
+and what they need, the hardware they were measured on, full results, the
+method, and the raw output. **[`samples/dsv4-flash-rtx5090`](samples/dsv4-flash-rtx5090/)**
+— a complete worked deployment: config, systemd unit, model fetch.
 
 ## The protocol lives in viiwork
 

@@ -3,6 +3,7 @@ package freetoken
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -305,5 +306,145 @@ func TestReadRSSMBHandlesMissingPid(t *testing.T) {
 	// Our own pid must produce something plausible.
 	if got := readRSSMB(1); got < 0 {
 		t.Errorf("got negative RSS %d", got)
+	}
+}
+
+// The context published must be what the backend will ACCEPT, not what the
+// checkpoint advertises. On the hardware this node exists for those differ by a
+// factor of sixteen: the engine sizes its KV pool from the VRAM left after the
+// weights and the expert cache, and rejects anything larger with a 400.
+// Publishing the advertised figure would be worse than a blank, because a
+// client would size a request by it.
+func TestContextLenIsTheServableOne(t *testing.T) {
+	var modelsHits, cacheHits int
+	b := serverOn(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.Write([]byte(healthServing))
+		case "/v1/stats":
+			w.Write([]byte(`{"requests":{"active":0}}`))
+		case "/v1/models":
+			modelsHits++
+			w.Write([]byte(`{"data":[{"id":"m","max_model_len":1048576,"context_length":1048576}]}`))
+		case "/v1/cache/status":
+			cacheHits++
+			w.Write([]byte(`{"state":"serving","geometry":{"num_pages":501,"page_size":128}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	if !b.Probe(context.Background()) {
+		t.Fatal("probe should succeed")
+	}
+	// 501 x 128 = 64128, the figure the real engine names in its 400.
+	if got := b.State.MaxModelLen(); got != 64128 {
+		t.Errorf("context: got %d, want the KV pool's 64128 rather than the advertised 1048576", got)
+	}
+	// Asked once per engine generation, not on every health tick: /v1/cache/status
+	// is a control-plane endpoint and the geometry only moves on a rebuild.
+	for i := 0; i < 5; i++ {
+		b.Probe(context.Background())
+	}
+	if modelsHits != 1 || cacheHits != 1 {
+		t.Errorf("polled models=%d cache=%d times, want 1 each", modelsHits, cacheHits)
+	}
+}
+
+// A missing read narrows the answer rather than voiding it.
+func TestContextLenFallsBackToWhicheverIsAvailable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cache string
+		want  int64
+	}{
+		{"no cache endpoint", "", 1048576},
+		{"cache endpoint present", `{"geometry":{"num_pages":501,"page_size":128}}`, 64128},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := serverOn(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/health":
+					w.Write([]byte(healthServing))
+				case "/v1/models":
+					w.Write([]byte(`{"data":[{"context_length":1048576}]}`))
+				case "/v1/cache/status":
+					if tc.cache == "" {
+						http.NotFound(w, r)
+						return
+					}
+					w.Write([]byte(tc.cache))
+				default:
+					w.Write([]byte(`{"requests":{"active":0}}`))
+				}
+			}))
+			if !b.Probe(context.Background()) {
+				t.Fatal("probe should succeed")
+			}
+			if got := b.State.MaxModelLen(); got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// The operator's answer always wins, and is published at spawn rather than
+// waiting for a probe — the mesh view is otherwise blank for the many minutes a
+// large model takes to load.
+func TestConfiguredContextLenIsNotOverridden(t *testing.T) {
+	b := serverOn(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.Write([]byte(healthServing))
+		case "/v1/models", "/v1/cache/status":
+			t.Errorf("%s must not be polled when max_seq_len is configured", r.URL.Path)
+		default:
+			w.Write([]byte(`{"requests":{"active":0}}`))
+		}
+	}))
+	b.Engine.MaxSeqLen = 32768
+	b.State.SetMaxModelLen(32768)
+	if !b.Probe(context.Background()) {
+		t.Fatal("probe should succeed")
+	}
+	if got := b.State.MaxModelLen(); got != 32768 {
+		t.Errorf("got %d, want the configured 32768", got)
+	}
+}
+
+// `ft ctl cache --kv N` resizes the pool live, which moves the ceiling. Coming
+// out of a rebuild has to invalidate what we learned, or the mesh keeps
+// publishing the old number.
+func TestContextRelearnedAfterCacheRebuild(t *testing.T) {
+	pages := int64(501)
+	b := serverOn(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.Write([]byte(healthServing))
+		case "/v1/models":
+			w.Write([]byte(`{"data":[{"context_length":1048576}]}`))
+		case "/v1/cache/status":
+			fmt.Fprintf(w, `{"geometry":{"num_pages":%d,"page_size":128}}`, pages)
+		default:
+			w.Write([]byte(`{"requests":{"active":0}}`))
+		}
+	}))
+	if !b.Probe(context.Background()) {
+		t.Fatal("probe should succeed")
+	}
+	if got := b.State.MaxModelLen(); got != 64128 {
+		t.Fatalf("initial context: got %d", got)
+	}
+
+	// A rebuild lands: the engine reports maintenance, then serves again with a
+	// bigger pool.
+	b.mu.Lock()
+	b.health = Health{Status: healthOK, Maintenance: "rebuilding"}
+	b.mu.Unlock()
+	pages = 1002
+	if !b.Probe(context.Background()) {
+		t.Fatal("probe should succeed after the rebuild")
+	}
+	if got := b.State.MaxModelLen(); got != 128256 {
+		t.Errorf("after rebuild: got %d, want the resized pool's 128256", got)
 	}
 }

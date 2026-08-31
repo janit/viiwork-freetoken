@@ -123,8 +123,13 @@ freetoken:
   # moe_backend: offload
 
   # max_seq_len: --max-seq-len-override, published to the mesh as the backend's
-  # context size. Omit to use the checkpoint's own value, in which case the
-  # mesh reports the context size as unknown rather than as zero.
+  # context size.
+  #
+  # Omitting it is the good default and costs nothing: the checkpoint's own
+  # limit applies, and the node asks the engine what that turned out to be and
+  # publishes the answer. Set this only to serve LESS context than the
+  # checkpoint allows — which is a real thing to want on a card where the
+  # expert cache is competing for the same VRAM.
   # max_seq_len: 32768
 
   # startup_timeout: how long a backend may take to report a serving /health.

@@ -22,6 +22,23 @@ DEST="${DEST:-/srv/models/$(basename "$REPO")}"
 ATTEMPTS="${ATTEMPTS:-40}"
 
 mkdir -p "$DEST"
+
+# Single instance per destination.
+#
+# Not defensive programming — this was hit. A download this long gets nudged:
+# you background it, the connection drops, you start it again, and now two
+# copies are running `curl -C -` against the same paths. Each resumes from the
+# offset IT sees, they interleave writes, and the result is a file of exactly
+# the right length and the wrong contents. The size check at the bottom passes,
+# and the corruption surfaces an hour later as a tensor that will not load.
+#
+# The lock is held for the life of the script and released when it exits, so a
+# second invocation exits immediately rather than joining in.
+exec 9>"$DEST/.fetch.lock"
+if ! flock -n 9; then
+    echo "another fetch is already running for $DEST (lock: $DEST/.fetch.lock)"
+    exit 1
+fi
 manifest=$(mktemp)
 trap 'rm -f "$manifest"' EXIT
 
@@ -43,12 +60,13 @@ echo "--- $REPO -> $DEST ---"; cat "$manifest"
 fail=0
 while read -r path want; do
     # Repo furniture: not needed to serve, and model.sig is large.
+    # .fetch.lock is ours, not the repo's.
     #
     # Note what is NOT skipped: inference/config.json. FreeToken reads the
     # authoritative DeepSeek-V4 model arguments from the inference/ subdir
     # rather than from the top-level config.json, and a checkout missing it
     # fails at load with an error that does not mention the missing file.
-    case "$path" in .gitattributes|README.md|model.sig) continue;; esac
+    case "$path" in .gitattributes|README.md|model.sig|.fetch.lock) continue;; esac
     out="$DEST/$path"
     mkdir -p "$(dirname "$out")"
     for attempt in $(seq 1 "$ATTEMPTS"); do

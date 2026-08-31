@@ -1,0 +1,40 @@
+{
+  "model": "Qwen3.8-Flash-Next-NVFP4",
+  "engine": "FreeToken main (source build), moe_backend=hybrid",
+  "note": "Cache budget is 18.2 GiB. KV and the MoE expert cache come out of it together, so context is bought with expert slots. Decode measured at concurrency 1, median of 3.",
+  "advertised_context": 262144,
+  "trade": [
+    {
+      "kv_tokens": 8192,
+      "moe_slots": 5932,
+      "moe_pct": 24.1,
+      "kv_vram": "198 MiB",
+      "moe_vram": "15.3 GiB",
+      "decode_tps": 53.8,
+      "note": "engine default"
+    },
+    {
+      "kv_tokens": 65536,
+      "moe_slots": 5000,
+      "moe_pct": 20.3,
+      "kv_vram": "1.5 GiB",
+      "moe_vram": "12.9 GiB",
+      "decode_tps": 53.0,
+      "note": "8x context for 1.5% throughput"
+    },
+    {
+      "kv_tokens": 262144,
+      "moe_slots": 3000,
+      "moe_pct": 12.2,
+      "kv_vram": "6.2 GiB",
+      "moe_vram": "7.7 GiB",
+      "decode_tps": 48.1,
+      "note": "full advertised context for 11% throughput"
+    }
+  ],
+  "failures_observed": [
+    "kv 65536 with moe unchanged: rejected up front -- needs 16.86 GiB > 15.51 GiB budget. Old cache kept, still serving.",
+    "shrinking kv back from 262144 to 65536 while growing moe: CUDA OOM, rolled back, still serving at 262144. Growing the expert cache back hits fragmentation; a restart is the reliable way back."
+  ],
+  "node_behaviour": "slot_ctx tracked every successful rebuild live (8192 -> 65536 -> 262144) with no restart."
+}

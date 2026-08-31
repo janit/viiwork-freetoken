@@ -212,3 +212,79 @@ func ParseStats(body []byte) (Stats, bool) {
 	}
 	return st, true
 }
+
+// modelsDoc is FreeToken's /v1/models. Only the context length is read: the
+// model id is already known (the node told the engine what to call it), and
+// everything else is presentation.
+type modelsDoc struct {
+	Data []struct {
+		MaxModelLen   int64 `json:"max_model_len"`
+		ContextLength int64 `json:"context_length"`
+	} `json:"data"`
+}
+
+// ParseContextLen reads the CHECKPOINT's context length from a /v1/models body.
+//
+// This is an upper bound, not what the backend will actually accept — see
+// ParseKVCapacity, and prefer the smaller of the two. On the deployment this
+// was written against the two differ by a factor of sixteen.
+//
+// Both spellings are read because the engine emits both, and a build that drops
+// either should not silently produce a blank.
+func ParseContextLen(body []byte) (int64, bool) {
+	var doc modelsDoc
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return 0, false
+	}
+	for _, m := range doc.Data {
+		if m.ContextLength > 0 {
+			return m.ContextLength, true
+		}
+		if m.MaxModelLen > 0 {
+			return m.MaxModelLen, true
+		}
+	}
+	return 0, false
+}
+
+// cacheStatusDoc is FreeToken's /v1/cache/status.
+type cacheStatusDoc struct {
+	Geometry struct {
+		NumPages int64 `json:"num_pages"`
+		PageSize int64 `json:"page_size"`
+	} `json:"geometry"`
+}
+
+// ParseKVCapacity reads how many tokens of KV the engine actually allocated,
+// which is the real ceiling on a request's prompt plus generation.
+//
+// This is the number that matters and it is not the one /v1/models reports. The
+// engine sizes its KV pool from the VRAM left after weights and the MoE expert
+// cache, so on a card serving a model far larger than itself the pool is a
+// small fraction of what the checkpoint allows. Measured on an RTX 5090 serving
+// DeepSeek-V4-Flash: /v1/models advertises 1,048,576 tokens, the KV pool holds
+// 64,128, and a 70,175-token prompt comes back
+//
+//	400 context_length_exceeded
+//	"prompt is too long: 70175 tokens > 64128 maximum (prompt + generation)"
+//
+// Publishing the advertised figure would therefore put a number on the
+// dashboard that the backend rejects — worse than a blank, because a client
+// would size a request by it.
+//
+// Deliberately NOT read from /v1/stats, which also reports kv.total_pages: that
+// document carries the page size from the unresolved config rather than the
+// resolved one (1 rather than 128 for a DSV4 checkpoint), so multiplying them
+// there understates the pool by two orders of magnitude. /v1/cache/status
+// reports the geometry the engine actually built.
+func ParseKVCapacity(body []byte) (int64, bool) {
+	var doc cacheStatusDoc
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return 0, false
+	}
+	g := doc.Geometry
+	if g.NumPages <= 0 || g.PageSize <= 0 {
+		return 0, false
+	}
+	return g.NumPages * g.PageSize, true
+}
