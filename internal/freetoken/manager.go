@@ -25,6 +25,10 @@ type Manager struct {
 	backends []*Backend
 	logger   *log.Logger
 	events   EventSink
+	// gpuUUIDs is the host's nvidia-smi index to card-UUID map, supplied once
+	// at startup and read-only afterwards. Nil when nvidia-smi is unavailable,
+	// which disables the pinning check rather than failing it.
+	gpuUUIDs map[int]string
 
 	stopOnce sync.Once
 
@@ -47,6 +51,14 @@ func NewManager(cfg *config.Config, events EventSink) (*Manager, error) {
 	}
 	return m, nil
 }
+
+// SetGPUUUIDs supplies the host's index-to-UUID map, against which each
+// backend's self-reported card is checked once it becomes healthy. Call it
+// before Start; it is not a runtime knob, and a UUID does not change for the
+// life of a card.
+//
+// Optional. Passing nil, or never calling it, skips the check.
+func (m *Manager) SetGPUUUIDs(u map[int]string) { m.gpuUUIDs = u }
 
 func (m *Manager) Backends() []*Backend { return m.backends }
 
@@ -115,6 +127,7 @@ func (m *Manager) checkOne(ctx context.Context, b *Backend) {
 			b.State.SetStatus(balancer.StatusHealthy)
 			m.logger.Printf("%s healthy", b.Label())
 			m.emit(meshapi.EventBackend, b, "%s healthy", b.Label())
+			m.verifyPinning(b)
 		}
 		return
 	}
@@ -162,6 +175,41 @@ func (m *Manager) checkOne(ctx context.Context, b *Backend) {
 	if hard || failures >= m.cfg.Health.FailureThreshold {
 		m.respawn(ctx, b)
 	}
+}
+
+// verifyPinning compares the card the engine says it bound against the card
+// this node told it to take. Once per engine generation, on the transition to
+// healthy — which also re-checks after a respawn, for free.
+//
+// Worth doing because the failure it catches is otherwise silent. This node
+// pins with CUDA_VISIBLE_DEVICES, whose index CUDA resolves in whatever order
+// CUDA_DEVICE_ORDER selects; get that wrong and the backend loads, serves and
+// answers every probe while the GPU panel attributes its load, its VRAM and its
+// wattage to a neighbouring card. Nothing else in the node would notice, and on
+// a host recording energy the misattribution is written to disk.
+//
+// A mismatch is reported, not acted on. The backend is serving correctly and
+// taking it out of the mesh would trade a wrong label for a lost GPU.
+//
+// Three cases are deliberately not a mismatch, all of them "unknown":
+// FreeToken only began reporting its GPU after 0.1.2, so the released engine
+// reports none; nvidia-smi may be unavailable, leaving nothing to compare
+// against; and a hypothetical multi-card backend has no single expected card.
+// Absent is not zero here as much as anywhere else on the wire — a check that
+// guessed would cry wolf on every node running the released engine.
+func (m *Manager) verifyPinning(b *Backend) {
+	got := b.GPUUUID()
+	if got == "" || len(m.gpuUUIDs) == 0 || len(b.GPUIDs) != 1 {
+		return
+	}
+	want, ok := m.gpuUUIDs[b.GPUIDs[0]]
+	if !ok || want == got {
+		return
+	}
+	m.logger.Printf("%s: pinned to GPU %d (%s) but the engine bound %s — check gpus.devices and CUDA_DEVICE_ORDER",
+		b.Label(), b.GPUIDs[0], want, got)
+	m.emit(meshapi.EventBackend, b, "%s is on the wrong GPU: expected %s, engine bound %s",
+		b.Label(), want, got)
 }
 
 func (m *Manager) respawn(ctx context.Context, b *Backend) {

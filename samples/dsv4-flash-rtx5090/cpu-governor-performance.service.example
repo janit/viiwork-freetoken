@@ -1,0 +1,37 @@
+# Pin the CPU governor to `performance` on a FreeToken host.
+#
+# Measured on the machine this sample is drawn from, DeepSeek-V4-Flash on an
+# RTX 5090, through the node, median of five:
+#
+#     schedutil     23.8 tok/s single stream
+#     performance   27.1 tok/s single stream     (+13.9%, reproduced 3x)
+#
+# An offload MoE backend computes most expert misses on the CPU, in bursts at
+# token cadence — a few milliseconds of work, a few idle, repeat. That is the
+# pattern schedutil ramps too slowly for. Idle package power costs 6.5 W.
+#
+# This belongs on hosts running THIS engine. On a node serving llama.cpp or
+# vLLM from VRAM the CPU is doing HTTP and sampling, and the same test showed
+# no gain — see "Host tuning" in README.md.
+#
+# Copy to /etc/systemd/system/cpu-governor-performance.service, then:
+#
+#     systemctl daemon-reload
+#     systemctl enable --now cpu-governor-performance
+#
+# sysfs does not survive a reboot, which is the only reason this file exists.
+
+[Unit]
+Description=Pin CPU governor to performance (FreeToken MoE offload host)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > "$c"; done'
+# Restores the common default on stop, so `systemctl disable --now` is a real
+# revert rather than leaving the box pinned.
+ExecStop=/bin/bash -c 'for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo schedutil > "$c"; done'
+
+[Install]
+WantedBy=multi-user.target

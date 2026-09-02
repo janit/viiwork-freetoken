@@ -135,7 +135,19 @@ type statsDoc struct {
 	Mamba *pool `json:"mamba"`
 	SWA   *pool `json:"swa"`
 
-	VRAMBytes  int64 `json:"vram_bytes"`
+	VRAMBytes int64 `json:"vram_bytes"`
+	// GPUs is the engine's own account of the card it bound. Added upstream
+	// after 0.1.2 and therefore absent on the released engine, which is why a
+	// missing entry has to read as "unknown" rather than as a mismatch.
+	//
+	// Index is deliberately not read. It is the engine's *visible* CUDA
+	// ordinal, and under this node's one-card-per-process pinning exactly one
+	// device is visible, so it is always 0 and carries no information. UUID is
+	// the only field here that names a physical card.
+	GPUs []struct {
+		Name string `json:"name"`
+		UUID string `json:"uuid"`
+	} `json:"gpus"`
 	Throughput struct {
 		DecodeTPS  float64 `json:"decode_tps"`
 		PrefillTPS float64 `json:"prefill_tps"`
@@ -171,6 +183,17 @@ type Stats struct {
 	// DecodeTPS and VRAMBytes are reported for the dashboard, not acted on.
 	DecodeTPS float64
 	VRAMBytes int64
+	// GPUUUID is the card the engine says it actually bound, and GPUName its
+	// marketing name. Empty on an engine that predates the field.
+	//
+	// This is the only thing in either document that can be checked against
+	// something outside the engine, and it is worth checking: pinning happens
+	// through CUDA_VISIBLE_DEVICES, whose index CUDA reads in whatever order
+	// CUDA_DEVICE_ORDER selects, and getting that wrong produces a backend
+	// that serves perfectly while every dashboard attributes its load and its
+	// wattage to a neighbouring card. See Manager.verifyPinning.
+	GPUUUID string
+	GPUName string
 	// Found records which of the above actually appeared, so a consumer can
 	// tell "no requests running" from "this build does not report that".
 	Found map[string]bool
@@ -209,6 +232,16 @@ func ParseStats(body []byte) (Stats, bool) {
 	}
 	if doc.VRAMBytes > 0 {
 		st.Found["vram"] = true
+	}
+	// The first entry is the primary TP rank. There is only ever one: FreeToken
+	// has --tensor-parallel-size but does not yet place more than one card, and
+	// the list exists upstream so that it can later.
+	if len(doc.GPUs) > 0 {
+		st.GPUName = doc.GPUs[0].Name
+		if u := doc.GPUs[0].UUID; u != "" {
+			st.GPUUUID = u
+			st.Found["gpu_uuid"] = true
+		}
 	}
 	return st, true
 }

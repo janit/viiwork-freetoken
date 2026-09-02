@@ -28,8 +28,12 @@ services:
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
       # FreeToken's own cache: JIT-compiled CUDA kernels and the `ft bench bw`
       # bandwidth profile. Without this volume every container start recompiles
-      # kernels, and the profile that makes --moe-backend auto pick `hybrid` is
-      # lost on each restart.
+      # the kernels it does not find prebuilt, and the profile that makes
+      # --moe-backend auto pick `hybrid` is lost on each restart.
+      #
+      # The image ships upstream's prebuilt kernel cache where one is published
+      # for the installed release (see the Dockerfile), which shortens that
+      # compile — it does not remove it, so keep the volume.
       - ${HOME}/.cache/freetoken:/root/.cache/freetoken
     environment:
       # Only needed for gated or private models.

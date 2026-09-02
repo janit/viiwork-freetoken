@@ -91,6 +91,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("backends: %v", err)
 	}
+	// The host's card identities, so a backend that reports which GPU it bound
+	// can be checked against the one gpus.devices named. Nil without
+	// nvidia-smi, which skips the check — see Manager.verifyPinning.
+	manager.SetGPUUUIDs(gpu.UUIDs())
 	states := manager.States()
 	bal := balancer.New(states, cfg.Balancer.HighLoadThreshold, cfg.Balancer.MaxInFlightPerBackend)
 

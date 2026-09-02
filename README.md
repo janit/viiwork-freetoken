@@ -124,9 +124,11 @@ $EDITOR viiwork-freetoken.yaml        # set model.name, model.path, gpus.devices
 make build && ./bin/viiwork-freetoken --config viiwork-freetoken.yaml
 ```
 
-FreeToken itself is installed separately — `pip install "freetoken[accel]"` into
-a virtualenv, with a CUDA 13 toolkit and driver r580+ on the host. Point
-`freetoken.binary` at its `ft`.
+FreeToken itself is installed separately — `pip install "freetoken[accel]" ninja`
+into a virtualenv, with a CUDA 13 toolkit and driver r580+ on the host. Point
+`freetoken.binary` at its `ft`. `ninja` is not a declared dependency of the
+engine and is not optional: without it the first JIT compile fails with
+`[Errno 2] No such file or directory: 'ninja'`.
 
 There is a Dockerfile, but read its header first: the image has to install the
 engine itself and must be built on a *devel* CUDA base, because FreeToken

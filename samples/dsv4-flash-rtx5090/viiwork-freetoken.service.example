@@ -18,6 +18,12 @@ Description=viiwork-freetoken mesh node (DeepSeek-V4-Flash)
 After=network-online.target
 Wants=network-online.target
 
+# Give up after three failed starts in an hour rather than reloading a model
+# that cannot load, forever. See the Restart= comment below for why the systemd
+# defaults do not achieve this on their own.
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
 [Service]
 Type=simple
 User=viiwork
@@ -56,7 +62,14 @@ KillSignal=SIGTERM
 TimeoutStopSec=180
 
 # A model that cannot load will never load. The node's own max_respawns bounds
-# the inner loop; this bounds the outer one.
+# the inner loop; StartLimitBurst in [Unit] bounds the outer one.
+#
+# The limit is not optional and the defaults do not provide it: systemd ships
+# StartLimitIntervalSec=10s with StartLimitBurst=5, and at RestartSec=30s you
+# can never fit five starts into a ten-second window, so the rate limiter never
+# trips and a hopeless model reloads forever. Observed: a checkpoint whose dense
+# weights exceed the card OOMs inside load_state_dict every time, and each
+# attempt re-reads the whole checkpoint first.
 Restart=on-failure
 RestartSec=30s
 

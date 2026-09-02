@@ -3,6 +3,7 @@ package freetoken
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -209,4 +210,100 @@ func TestShutdownIsIdempotent(t *testing.T) {
 	m, _ := testManager(t, nil)
 	m.Shutdown()
 	m.Shutdown() // must not panic or double-signal
+}
+
+// Pinning verification.
+//
+// The engine reports the card it actually bound; nvidia-smi says which card the
+// configured index names. Comparing them catches the one deployment error this
+// node cannot otherwise see — a backend serving correctly on a card the whole
+// fleet attributes to a neighbour.
+
+const (
+	cardZero = "GPU-2f3a9b1c-8d7e-4a05-b6c1-0e5f9a3d7b42"
+	cardOne  = "GPU-9e8d7c6b-5a49-4f13-8207-c1b0a4e6d3f5"
+)
+
+// engineOn splices a backend backed by a fake engine into a manager, so
+// checkOne drives the real transition to healthy.
+func engineOn(t *testing.T, m *Manager, statsBody string) *Backend {
+	t.Helper()
+	b := serverOn(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.Write([]byte(healthServing))
+		case "/v1/stats":
+			w.Write([]byte(statsBody))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	m.backends = []*Backend{b}
+	return b
+}
+
+func statsOnCard(uuid string) string {
+	return `{"requests":{"active":0},"gpus":[{"index":0,"name":"NVIDIA GeForce RTX 5090","uuid":"` + uuid + `"}]}`
+}
+
+// CUDA_VISIBLE_DEVICES=0 under the wrong CUDA_DEVICE_ORDER lands on a different
+// card than nvidia-smi calls 0. The backend is healthy and wrong.
+func TestMispinnedBackendIsReported(t *testing.T) {
+	m, rec := testManager(t, nil)
+	m.SetGPUUUIDs(map[int]string{0: cardZero, 1: cardOne})
+	b := engineOn(t, m, statsOnCard(cardOne))
+
+	m.checkOne(context.Background(), b)
+
+	if !rec.contains("wrong GPU") {
+		t.Errorf("a mispinned backend must be visible on the activity feed: %v", rec.events)
+	}
+	// Reported, not acted on: it is serving, and taking it out of the mesh
+	// would trade a wrong label for a lost GPU.
+	if got := b.State.Status(); got != balancer.StatusHealthy {
+		t.Errorf("status = %v, want healthy — a mislabelled backend still serves", got)
+	}
+}
+
+func TestCorrectlyPinnedBackendIsSilent(t *testing.T) {
+	m, rec := testManager(t, nil)
+	m.SetGPUUUIDs(map[int]string{0: cardZero, 1: cardOne})
+	b := engineOn(t, m, statsOnCard(cardZero))
+
+	m.checkOne(context.Background(), b)
+
+	if rec.contains("wrong GPU") {
+		t.Errorf("the configured card matched; nothing to report: %v", rec.events)
+	}
+}
+
+// FreeToken 0.1.2 — the released engine — reports no card at all. Absent is
+// unknown, not a mismatch, or every node on the shipped release cries wolf.
+func TestEngineWithoutCardReportingIsNotAMismatch(t *testing.T) {
+	m, rec := testManager(t, nil)
+	m.SetGPUUUIDs(map[int]string{0: cardZero})
+	b := engineOn(t, m, `{"requests":{"active":0},"kv":{"used_pages":1,"total_pages":2}}`)
+
+	m.checkOne(context.Background(), b)
+
+	if rec.contains("wrong GPU") {
+		t.Errorf("an engine that reports no card cannot be mispinned: %v", rec.events)
+	}
+	if b.GPUUUID() != "" {
+		t.Errorf("GPUUUID = %q, want empty", b.GPUUUID())
+	}
+}
+
+// No nvidia-smi, nothing to compare against. The check disables itself rather
+// than treating an empty map as a card that matches nothing.
+func TestPinningCheckSkippedWithoutNvidiaSMI(t *testing.T) {
+	m, rec := testManager(t, nil)
+	m.SetGPUUUIDs(nil)
+	b := engineOn(t, m, statsOnCard(cardOne))
+
+	m.checkOne(context.Background(), b)
+
+	if rec.contains("wrong GPU") {
+		t.Errorf("without nvidia-smi there is no expectation to violate: %v", rec.events)
+	}
 }

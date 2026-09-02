@@ -32,6 +32,7 @@ before ordering the download.
 | `viiwork-freetoken.yaml.example` | The node config, with the reasoning for every non-default value. |
 | `viiwork-freetoken.service.example` | A native systemd unit, which is the recommended shape here. |
 | `fetch-model.sh` | Downloads a HF repo with an outer resume loop. At 156 GB this is not optional. |
+| `cpu-governor-performance.service.example` | Pins the CPU governor. Worth 13.9% on this engine; see [Host tuning](#host-tuning-one-setting-that-pays-one-that-does-not). |
 
 Copy the `.example` files without the suffix; the real names are gitignored
 because they are deployment-specific.
@@ -43,9 +44,11 @@ because they are deployment-specific.
 nvidia-smi
 nvcc --version                     # must be on PATH at RUN time, not just install time
 
-# 2. The engine, in its own virtualenv.
+# 2. The engine, in its own virtualenv. ninja is not a declared dependency and
+#    is not optional: without it `ft bench bw` dies with [Errno 2] 'ninja'
+#    the moment it JIT-compiles its first kernel.
 python3 -m venv /opt/freetoken/.venv
-/opt/freetoken/.venv/bin/pip install "freetoken[accel]"
+/opt/freetoken/.venv/bin/pip install "freetoken[accel]" ninja
 /opt/freetoken/.venv/bin/ft --version
 
 # 3. Weights. Hours, and it will be interrupted. That is what the loop is for.
@@ -59,7 +62,11 @@ DEST=/srv/models/DeepSeek-V4-Flash-0731 ./fetch-model.sh
   --model /srv/models/DeepSeek-V4-Flash-0731 \
   --out   /srv/models/DeepSeek-V4-Flash-0731-ftw
 
-# 6. The node.
+# 6. Pin the CPU governor. Worth 13.9% here — see "Host tuning" below.
+install -m644 cpu-governor-performance.service /etc/systemd/system/
+systemctl enable --now cpu-governor-performance
+
+# 7. The node.
 make build && install -m755 bin/viiwork-freetoken /usr/local/bin/
 install -m644 viiwork-freetoken.yaml /etc/viiwork/
 systemctl enable --now viiwork-freetoken && journalctl -fu viiwork-freetoken
@@ -271,6 +278,47 @@ build of `main` (which has one). Identical behaviour in both: the same
 published, working inference. That is the point of pinning the card through
 `CUDA_VISIBLE_DEVICES` instead of the flag — see the Dockerfile and
 `internal/freetoken.Backend.Env`.
+
+## Host tuning: one setting that pays, one that does not
+
+Both measured on this host with DeepSeek-V4-Flash, through the node, decode rate
+excluding TTFT, median of five with fresh random filler per run.
+
+**The CPU governor is worth 13.9%, and it is one sysfs write.**
+
+| governor | decode, 1 stream | 4 concurrent |
+| --- | ---: | ---: |
+| `schedutil` (the distro default) | 23.8 tok/s | 48.6 / 50.0 |
+| **`performance`** | **27.1 tok/s** | 52.5 / 52.0 / 50.5 |
+
+Reproduced three times across two engine restarts, with `schedutil` runs either
+side of them agreeing to within 0.5%. The mechanism is specific to this engine:
+an offload MoE backend computes most expert misses on the CPU in bursts at token
+cadence — a few milliseconds of work, a few idle, repeat — which is exactly the
+shape `schedutil` ramps too slowly for. It costs 6.5 W at idle (66.2 W against
+59.7 W of package power), and sysfs does not survive a reboot, so
+[`cpu-governor-performance.service.example`](cpu-governor-performance.service.example)
+is here to make it stick.
+
+Scope it to hosts running *this* engine. The same test on a node serving
+llama.cpp from VRAM showed no gain, because there the CPU is doing HTTP and
+sampling rather than expert arithmetic — and a host shared by ten backends is
+too noisy to resolve a 13% effect anyway.
+
+**Transparent huge pages are not worth setting, and testing the obvious knob
+gives you a false negative twice over.** The expert banks are *shared* memory —
+`mmap` of `/dev/zero`, `MAP_SHARED`, in 2 GB chunks in the spawned worker — so
+`transparent_hugepage/enabled=always` never touches them. It produced 1.27 GB of
+`AnonHugePages` that were PyTorch's own allocations while all 143.7 GB of banks
+stayed on 4 KiB pages. The knob that reaches them is
+`transparent_hugepage/shmem_enabled=always`, which does work — `ShmemPmdMapped`
+goes to the full 143.7 GB, collapsing ~35M page-table entries into ~68.5k.
+
+It buys nothing: 26.3 tok/s against 27.0. Each expert is a ~12.75 MB sequential
+read, so a page walk amortises over 4 KiB of streaming data, and with the CPU
+path already at roughly three quarters of this machine's STREAM ceiling
+(106 GB/s of 143.3), the TLB was never what consumed the remaining headroom.
+Recorded here so nobody pays for the experiment twice.
 
 ## Why not the container
 

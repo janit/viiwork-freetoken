@@ -26,6 +26,47 @@ them with `freetoken.binary`.
 cache](#context-is-bought-with-expert-cache-and-it-is-cheap). The 262,144 figure
 is the checkpoint's full advertised window, reached for an 11% throughput cost.
 
+### What decides whether a checkpoint will load at all
+
+Disk size is the number people check and it is the wrong one. The experts live
+in host RAM, but everything that is *not* an expert has to be resident on the
+card, and on these checkpoints that set is much larger than it looks:
+
+| | dense, GPU-resident | experts + tables, host RAM |
+| --- | ---: | ---: |
+| Qwen3.8-Flash-Next NVFP4 | **16.0 GB** | 68.0 GB experts + 51.2 GB PLE |
+
+16.0 GB is not a small residue of a 126 GB checkpoint — it is the whole reason
+this model needs a 32 GB card rather than a 16 GB one. The NVFP4 quant config
+leaves `*.self_attn.*`, `*.linear_attn.*` and `*.ple.*` in bf16 and the
+248,320-entry vocab head is untied, so the unquantised part is most of it.
+
+On a 10 GiB RTX 3080 this fails as `torch.OutOfMemoryError` inside
+`load_state_dict`, before the KV pool or the expert cache are sized at all —
+which means **no `--moe-cache-size`, `--moe-cache-rate`, `--memory-ratio` or
+`--moe-backend` setting can rescue it.** Those trade against the pools. The
+weights are not negotiable.
+
+You can compute it from the repo listing before downloading anything, because
+the shards are named by role:
+
+```sh
+# sums the non-expert, non-PLE shards — what has to fit on the card
+curl -s https://huggingface.co/api/models/$REPO/tree/main \
+  | python3 -c 'import json,sys; print(sum((f.get("lfs") or {}).get("size",0)
+      for f in json.load(sys.stdin)
+      if f["path"].endswith(".safetensors") and "experts" not in f["path"]
+      and "ple" not in f["path"])/1e9, "GB")'
+```
+
+**Dense models are the same trap with no escape hatch.** `auto` resolves a dense
+model to `fused`, so every weight is resident and the offload machinery does not
+apply at all: `RedHatAI/Muse-Glimmer-30B-NVFP4` is 23.4 GB on disk and needs
+23.4 GB of VRAM, because its parameters are one MLP stack rather than experts.
+The snippet above is the check: on a dense model it returns the whole
+checkpoint. Look for `num_experts` in the config too, before assuming something
+benefits from this engine.
+
 **Recommendation for this class of host:** prefer NVFP4 over FP8. It is not
 close — 2.3x the throughput on 50 GB less host RAM — and the reason is
 structural, not a tuning accident. See [FP8 vs NVFP4](#fp8-vs-nvfp4-measured).
@@ -223,6 +264,18 @@ worth repeating because each produced a plausible-looking number:
   actually idles at 13.4 W once it has settled.
 - **A counting prompt that stopped after 19 tokens**, which made
   aggregate-throughput-over-wall almost entirely prefill.
+
+**Do not try to measure the CPU side with `perf`'s cache events.** On this
+workload `cache-misses` reports ~11 GB/s and the AMD L1D fill events
+(`ls_refills_from_sys`, `ls_hw_pf_dc_fill`, `ls_sw_pf_dc_fill`, all
+`.ls_mabresp_lcl_dram`) report ~3.9 GB/s, against a real figure north of
+37 GB/s. They do not see the streaming path, and `nps1_die_to_dram` needs the
+`amd_df` PMU, which these kernels do not expose. What does work is a
+multi-threaded DRAM read probe run idle and then again during a decode: it
+reproduces `ft bench bw`'s STREAM figure to within 0.3%, and the drop is the
+bandwidth the decode is consuming. Stealing bandwidth that way also drops GPU
+utilisation from ~50% to 38%, which is the cleanest demonstration that host
+memory paces the card rather than the other way round.
 
 Token counts are the engine's own (`/v1/messages/count_tokens`), not a
 words-times-a-constant estimate — the two differ by more than 2x for random

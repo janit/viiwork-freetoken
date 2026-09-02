@@ -55,6 +55,9 @@ type Backend struct {
 	// health is the last /health document read, kept so the manager can say
 	// what a not-yet-ready backend is actually doing.
 	health Health
+	// gpuUUID is the card the engine reported binding, from /v1/stats. Empty
+	// until the first refresh, and on any engine at or before 0.1.2.
+	gpuUUID string
 	// ctxLearned records that the served context length has been read from the
 	// engine, so it is asked once per process rather than on every tick. It is
 	// a property of the loaded checkpoint and cannot change while the process
@@ -275,6 +278,14 @@ func (b *Backend) Health() Health {
 	return b.health
 }
 
+// GPUUUID is the card the engine reported binding on the last stats refresh.
+// Empty when it reported none, which an engine at or before 0.1.2 always does.
+func (b *Backend) GPUUUID() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.gpuUUID
+}
+
 // Probe reads /health and, when the engine is serving, refreshes the scheduler
 // stats and RSS that ride on the mesh payload. It returns whether the backend
 // will actually take a request.
@@ -428,6 +439,9 @@ func (b *Backend) refreshStats(ctx context.Context) {
 	if !ok {
 		return
 	}
+	b.mu.Lock()
+	b.gpuUUID = st.GPUUUID
+	b.mu.Unlock()
 	// FreeToken publishes no queue-depth gauge, so the waiting count is
 	// derived here rather than read. It is exact, not an estimate: the backend
 	// binds loopback and this node is its only client, so every request the

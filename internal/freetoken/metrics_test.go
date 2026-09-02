@@ -12,7 +12,7 @@ const statsDense = `{
   "mamba": null,
   "swa": null,
   "vram_bytes": 29456789504,
-  "gpus": [{"index": 0, "name": "NVIDIA GeForce RTX 5090", "total_bytes": 34179383296}],
+  "gpus": [{"index": 0, "name": "NVIDIA GeForce RTX 5090", "uuid": "GPU-9e8d7c6b-5a49-4f13-8207-c1b0a4e6d3f5", "total_bytes": 34179383296}],
   "throughput": {"decode_tps": 41.5, "prefill_tps": 1180.2},
   "requests": {"active": 3, "completed": 187, "p95_ms": 8100, "ttft_mean_ms": 620,
                "prompt_tokens_total": 918273, "completion_tokens_total": 55120}
@@ -268,5 +268,39 @@ func TestLiveKVCapacity(t *testing.T) {
 	adv, _ := ParseContextLen([]byte(liveModels))
 	if adv <= got {
 		t.Errorf("this test is pointless unless the advertised %d exceeds the servable %d", adv, got)
+	}
+}
+
+// The engine's own account of the card it bound is the one field in either
+// document that can be checked against something outside the engine.
+func TestParseStatsReadsTheBoundCard(t *testing.T) {
+	got, ok := ParseStats([]byte(statsDense))
+	if !ok {
+		t.Fatal("ParseStats failed")
+	}
+	if got.GPUUUID != "GPU-9e8d7c6b-5a49-4f13-8207-c1b0a4e6d3f5" {
+		t.Errorf("GPUUUID = %q, want the card's UUID", got.GPUUUID)
+	}
+	if got.GPUName != "NVIDIA GeForce RTX 5090" {
+		t.Errorf("GPUName = %q", got.GPUName)
+	}
+	if !got.Found["gpu_uuid"] {
+		t.Error("a reported card must be marked found")
+	}
+}
+
+// gpus[] arrived upstream after 0.1.2. The released engine reports none, and
+// that has to read as "unknown" rather than as a card that matches nothing —
+// otherwise every node running the shipped release reports itself mispinned.
+func TestAbsentGPUsIsUnknownNotAMismatch(t *testing.T) {
+	got, ok := ParseStats([]byte(liveStats))
+	if !ok {
+		t.Fatal("ParseStats failed")
+	}
+	if got.GPUUUID != "" {
+		t.Errorf("GPUUUID = %q, want empty on an engine that reports no card", got.GPUUUID)
+	}
+	if got.Found["gpu_uuid"] {
+		t.Error("an engine that reports no card must not be marked found")
 	}
 }

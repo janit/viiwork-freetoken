@@ -14,7 +14,9 @@
 #   * It must be a *devel* CUDA image, not a runtime one. FreeToken JIT-compiles
 #     its kernels on first use and needs nvcc on PATH at RUN TIME, not just at
 #     build time. A runtime image passes docker build and then fails on the
-#     first request.
+#     first request. The kernel-cache wheel below shortens that compile; it does
+#     not remove it, because a kernel absent from the cache still falls back to
+#     nvcc.
 #   * The JIT cache and the model cache belong on volumes. Without them every
 #     container start recompiles kernels and re-downloads weights — see
 #     docker-compose.yaml.example.
@@ -28,6 +30,8 @@
 # the toolkit the kernels are compiled against.
 ARG CUDA_TAG=13.3.1-devel-ubuntu24.04
 ARG FREETOKEN_VERSION=
+# Set to 0 to skip the prebuilt kernel cache and JIT everything on first use.
+ARG KERNEL_CACHE=1
 
 FROM golang:1.27.0 AS go-build
 WORKDIR /src
@@ -46,6 +50,7 @@ RUN CGO_ENABLED=0 go build -buildvcs=false \
 
 FROM nvidia/cuda:${CUDA_TAG}
 ARG FREETOKEN_VERSION
+ARG KERNEL_CACHE
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -60,6 +65,44 @@ RUN python3 -m venv "$VIRTUAL_ENV" \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "freetoken[accel]${FREETOKEN_VERSION:+==${FREETOKEN_VERSION}}" \
     && ft --version
+
+# Prebuilt CUDA kernels, when the installed release has a wheel that matches.
+#
+# FreeToken compiles its kernels with nvcc on first use. On a fresh machine that
+# is minutes added to a start that is already long, and it is why this image
+# carries a devel CUDA base. Upstream publishes a companion wheel of prebuilt
+# .so files — freetoken-kernel-cache — whose default arch list covers sm_80
+# through sm_120, so consumer Blackwell included.
+#
+# It is fetched by hand rather than pip-installed by name because it is NOT on
+# PyPI: it exists only as a GitHub release asset, and `freetoken[accel]` (which
+# is just [fi, sgl]) does not pull it. Three things shape the rest:
+#
+#   * The cache version must match the runtime exactly, and FreeToken RAISES on
+#     a mismatch rather than falling back to nvcc. A wrong wheel is therefore
+#     worse than no wheel — it takes the engine down. Both halves of the URL are
+#     derived from what is actually installed so they cannot drift.
+#   * The +cuXYZ suffix must match the CUDA major that *torch* was built for,
+#     not the CUDA_TAG above. Asking torch is exact; a build whose torch is a
+#     different CUDA generation simply 404s here and is skipped.
+#   * A version with no published asset is the ordinary case, not an error —
+#     upstream tags rarely. The build continues and the engine JITs as before.
+#
+# Only ever pair this with a PyPI release, which is what this image installs. A
+# source build of `main` reports 0.1.2 too (upstream does not bump version.py
+# between tags) and carries no build stamp, so upstream's own guard would accept
+# a stale cache from the release without a word.
+RUN if [ "$KERNEL_CACHE" != "0" ]; then \
+      ver="$(python -c 'import freetoken.version as v; print(v.__version__)')"; \
+      cu="$(python -c 'import torch; c=(torch.version.cuda or "").split("."); print("".join(c[:2]))')"; \
+      whl="freetoken_kernel_cache-${ver}%2Bcu${cu}-py3-none-linux_x86_64.whl"; \
+      url="https://github.com/FlashML-org/FreeToken/releases/download/v${ver}/${whl}"; \
+      if pip install --no-cache-dir "$url"; then \
+        echo "kernel cache: freetoken-kernel-cache ${ver}+cu${cu}"; \
+      else \
+        echo "kernel cache: no wheel for freetoken ${ver}+cu${cu}; kernels will JIT-compile on first use"; \
+      fi; \
+    fi
 
 # nvidia-smi comes from the NVIDIA container runtime rather than the image, so
 # GPU metrics require the container to be started with GPU access (see
