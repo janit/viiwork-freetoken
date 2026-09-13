@@ -1,5 +1,14 @@
 # viiwork-freetoken
 
+> **Frozen.** This repository is archived and receives no further changes.
+> FreeToken is now an engine *inside* [viiwork](https://github.com/janit/viiwork)
+> itself: as of viiwork **v2.2.0** a single binary per machine runs llama.cpp,
+> vLLM and FreeToken side by side on one mesh, so a separate FreeToken node
+> implementation no longer has a job. The FreeToken engine lives at
+> `internal/engine/freetoken` there. What is here still builds and still speaks
+> the mesh protocol it was written against — it is kept for reference, not
+> maintained. New work happens in viiwork.
+
 A [viiwork](https://github.com/janit/viiwork) mesh node backed by
 [**FreeToken**](https://github.com/FlashML-org/FreeToken) on **NVIDIA** GPUs.
 
